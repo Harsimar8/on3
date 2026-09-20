@@ -478,3 +478,100 @@
 .glb-card input[type="range"] {
     width: 100%;
 }
+
+/* ===========================================================
+   Radar beam controls
+   =========================================================== */
+
+.beam-control {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 9px 10px;
+    border-radius: 9px;
+    background: rgba(255, 255, 255, 0.025);
+    border: 1px solid rgba(255, 255, 255, 0.055);
+}
+
+.beam-control__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.beam-control__header span {
+    color: #9ca3af;
+    font-size: 11px;
+    letter-spacing: 0.02em;
+}
+
+.beam-control__header strong {
+    color: #e5e7eb;
+    font-size: 11px;
+    font-weight: 700;
+    min-width: 34px;
+    text-align: right;
+}
+
+.beam-slider {
+    width: 100%;
+    height: 4px;
+    margin: 2px 0;
+    appearance: none;
+    -webkit-appearance: none;
+    background: linear-gradient(
+        to right,
+        #334155,
+        #60a5fa
+    );
+    border-radius: 999px;
+    cursor: pointer;
+}
+
+.beam-slider::-webkit-slider-thumb {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #60a5fa;
+    border: 2px solid #0f172a;
+    box-shadow: 0 0 0 1px rgba(96,165,250,.5);
+    cursor: pointer;
+}
+
+.beam-slider::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #60a5fa;
+    border: 2px solid #0f172a;
+    box-shadow: 0 0 0 1px rgba(96,165,250,.5);
+    cursor: pointer;
+}
+
+.beam-slider--interior {
+    background: linear-gradient(
+        to right,
+        #1e293b,
+        #a78bfa
+    );
+}
+
+.beam-slider--interior::-webkit-slider-thumb {
+    background: #a78bfa;
+    box-shadow: 0 0 0 1px rgba(167,139,250,.5);
+}
+
+.beam-slider--interior::-moz-range-thumb {
+    background: #a78bfa;
+    box-shadow: 0 0 0 1px rgba(167,139,250,.5);
+}
+
+.beam-control__range {
+    display: flex;
+    justify-content: space-between;
+    color: #64748b;
+    font-size: 9px;
+}

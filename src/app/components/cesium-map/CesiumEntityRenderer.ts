@@ -97,6 +97,11 @@ export class CesiumEntityRenderer {
 
             drawRays: props.drawRays ?? false,
 
+            beamOpacity: props.beamOpacity ?? 0.28,
+            interiorOpacity: props.interiorOpacity ?? 0.08,
+            showInterior: props.showInterior ?? true,
+            interiorLayers: props.interiorLayers ?? 3,
+
             zoneVisibility: props.zoneVisibility ?? {},
             zoneRanges: props.zoneRanges ?? {},
             zoneElevations: props.zoneElevations ?? {},
@@ -158,13 +163,19 @@ export class CesiumEntityRenderer {
                     // on purpose: the coverage builder then derives it from each
                     // zone's range so every zone samples at the same ground
                     // resolution instead of coarsening as range grows.
-                    azimuthStepDeg: props.azimuthStepDeg ?? 0.50,
-                    elevationRingsPerZone: props.elevationRingsPerZone ?? 20,
+                    azimuthStepDeg: props.azimuthStepDeg ?? 5,
+                    elevationRingsPerZone: props.elevationRingsPerZone ?? 10,
                     rangeSampleSteps: props.rangeSampleSteps,
                     // On by default so placed GLB objects block rays. Each ray
                     // rejects a model on its bounding sphere first, so scenes
                     // with no objects near the beam cost almost nothing.
                     useObjectPicking: props.useObjectPicking ?? true,
+
+                    beamOpacity: props.beamOpacity ?? 0.28,
+                    interiorOpacity: props.interiorOpacity ?? 0.08,
+                    showInterior: props.showInterior ?? true,
+                    interiorLayers: props.interiorLayers ?? 3,
+
                     zoneOverrides
                 }
             );

@@ -10,6 +10,7 @@ import {
 } from '@angular/core';
 
 import * as Cesium from 'cesium';
+import { CommonModule } from '@angular/common';
 import { CesiumRadarCoverage } from './CesiumRadarCoverage';
 import { CesiumPlacement } from './CesiumPlacement';
 import { CesiumEntityRenderer } from "./CesiumEntityRenderer";
@@ -30,7 +31,7 @@ Cesium.Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOi
 @Component({
   selector: 'app-cesium-map',
   standalone: true,
-  imports: [],
+  imports: [CommonModule],
   templateUrl: './cesium-map.html',
   styleUrl: './cesium-map.css'
 })
@@ -498,6 +499,34 @@ export class CesiumMap implements AfterViewInit, OnDestroy {
   onDrawRaysChange(checked: boolean): void {
     this.updateRadarProperty({ drawRays: checked });
   }
+
+  onBeamOpacityChange(value: string): void {
+  const opacity = Math.max(
+    0,
+    Math.min(1, +value)
+  );
+
+  this.updateRadarProperty({
+    beamOpacity: opacity
+  });
+}
+
+onInteriorOpacityChange(value: string): void {
+  const opacity = Math.max(
+    0,
+    Math.min(0.30, +value)
+  );
+
+  this.updateRadarProperty({
+    interiorOpacity: opacity
+  });
+}
+
+onInteriorToggle(checked: boolean): void {
+  this.updateRadarProperty({
+    showInterior: checked
+  });
+}
 
   toggleDrawRays(): void {
     this.onDrawRaysChange(!this.getRadarProp('drawRays', false));

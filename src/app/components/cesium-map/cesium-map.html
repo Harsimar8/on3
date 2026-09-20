@@ -83,6 +83,69 @@
             (change)="onDrawRaysChange($any($event.target).checked)">
           <span>Draw 3D Rays</span>
         </label>
+
+        <div class="beam-control">
+
+  <div class="beam-control__header">
+    <span>Beam Opacity</span>
+    <strong>
+      {{ getRadarProp('beamOpacity', 0.28) * 100 | number:'1.0-0' }}%
+    </strong>
+  </div>
+
+  <input
+    class="beam-slider"
+    type="range"
+    min="0"
+    max="1"
+    step="0.01"
+    [value]="getRadarProp('beamOpacity', 0.28)"
+    (input)="onBeamOpacityChange($any($event.target).value)"
+  >
+
+  <div class="beam-control__range">
+    <span>Transparent</span>
+    <span>Solid</span>
+  </div>
+
+</div>
+
+
+<div class="beam-control">
+
+  <div class="beam-control__header">
+    <span>Interior Beam</span>
+    <strong>
+      {{ getRadarProp('interiorOpacity', 0.08) * 100 | number:'1.0-0' }}%
+    </strong>
+  </div>
+
+  <input
+    class="beam-slider beam-slider--interior"
+    type="range"
+    min="0"
+    max="0.30"
+    step="0.01"
+    [value]="getRadarProp('interiorOpacity', 0.08)"
+    (input)="onInteriorOpacityChange($any($event.target).value)"
+  >
+
+  <div class="beam-control__range">
+    <span>Off</span>
+    <span>Strong</span>
+  </div>
+
+</div>
+
+
+<label class="checkbox-field">
+  <input
+    type="checkbox"
+    [checked]="getRadarProp('showInterior', true)"
+    (change)="onInteriorToggle($any($event.target).checked)"
+  >
+  <span>Show Interior Beam</span>
+</label>
       </section>
 
       <section class="radar-section">
