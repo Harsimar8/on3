@@ -7,27 +7,11 @@ import { Team } from "../../core/types/Team";
 import { TeamFilter } from "../../core/models/TeamFilter";
 import { CesiumRadarCoverage, RadarCoverageHandle, RadarZoneOverride } from "./CesiumRadarCoverage";
 
-
 export class CesiumEntityRenderer {
 
-    // Live radar coverage handles, keyed by source entity.id
     private readonly radarEntities = new Map<string, RadarCoverageHandle[]>();
-
-    // Signature of the exact inputs (position + radar properties) that the
-    // currently-built coverage for an entity was generated from. If a
-    // render() call comes in and nothing in this signature changed, we skip
-    // rebuilding entirely - this is what stops the ray fan from swimming
-    // on every camera pan/zoom/selection change.
     private readonly lastBuiltSignature = new Map<string, string>();
-
-    // Guards against overlapping async rebuilds for the same entity
     private readonly buildInFlight = new Set<string>();
-
-    // Latest entity state that arrived while a build was already running. A
-    // rebuild takes long enough (terrain sampling per ray) that a drag can
-    // easily finish mid-build, so the newest state is parked here and built as
-    // soon as the running build finishes - otherwise the drop position would
-    // never be rendered at all.
     private readonly pendingRebuild = new Map<string, Entity>();
 
     constructor(
@@ -56,7 +40,6 @@ export class CesiumEntityRenderer {
             }
         }
 
-        // Clean up coverage for radars that no longer exist / no longer pass the filter
         for (const existingId of Array.from(this.radarEntities.keys())) {
             if (!seenIds.has(existingId)) {
                 this.removeRadarCoverage(existingId);
@@ -66,7 +49,6 @@ export class CesiumEntityRenderer {
         this.viewer.scene.requestRender();
     }
 
-    /** Drops the cached signature so the next render() call rebuilds this radar from scratch. */
     forceRebuild(entityId: string): void {
         this.lastBuiltSignature.delete(entityId);
     }
@@ -97,14 +79,23 @@ export class CesiumEntityRenderer {
 
             drawRays: props.drawRays ?? false,
 
+            // Opacity/color are appearance-only in principle, but they're
+            // still included here deliberately: per-zone beam/interior
+            // opacity overrides feed into which alpha value the mesh is
+            // built with (Cesium bakes color into the geometry instance
+            // attribute at construction), so a change does need a rebuild
+            // with the current Primitive setup. If/when that becomes a
+            // pure appearance update, drop these three lines to skip the
+            // terrain recomputation on opacity-only changes.
             beamOpacity: props.beamOpacity ?? 0.28,
             interiorOpacity: props.interiorOpacity ?? 0.08,
             showInterior: props.showInterior ?? true,
-            
 
             zoneVisibility: props.zoneVisibility ?? {},
             zoneRanges: props.zoneRanges ?? {},
             zoneElevations: props.zoneElevations ?? {},
+            zoneHeadings: props.zoneHeadings ?? {},   // NEW - per-zone azimuthStartDeg
+            zoneWidths: props.zoneWidths ?? {},       // NEW - per-zone azimuthWidthDeg
 
             azimuthStepDeg: props.azimuthStepDeg,
             elevationRingsPerZone: props.elevationRingsPerZone,
@@ -118,13 +109,10 @@ export class CesiumEntityRenderer {
         const signature = this.buildSignature(entity);
 
         if (this.lastBuiltSignature.get(entity.id) === signature) {
-            // Nothing relevant changed - keep existing entities as-is.
             return;
         }
 
         if (this.buildInFlight.has(entity.id)) {
-            // Park the newest state; the running build rebuilds from it when
-            // it finishes. Older parked states are simply overwritten.
             this.pendingRebuild.set(entity.id, entity);
             return;
         }
@@ -141,7 +129,9 @@ export class CesiumEntityRenderer {
                     visible: props.zoneVisibility?.[zone.name] ?? true,
                     range: props.zoneRanges?.[zone.name],
                     minElevationDeg: props.zoneElevations?.[zone.name]?.min,
-                    maxElevationDeg: props.zoneElevations?.[zone.name]?.max
+                    maxElevationDeg: props.zoneElevations?.[zone.name]?.max,
+                    azimuthStartDeg: props.zoneHeadings?.[zone.name],
+                    azimuthWidthDeg: props.zoneWidths?.[zone.name]
                 };
             }
 
@@ -157,18 +147,9 @@ export class CesiumEntityRenderer {
                     sectorStartDeg: props.sectorStartDeg ?? 0,
                     sectorSweepDeg: props.sectorSweepDeg ?? 360,
                     drawRays: props.drawRays ?? false,
-                    // Multi-ring precision sampling. Raise these per-radar via
-                    // entity properties for finer detail (cost scales as
-                    // azimuths x rings x steps). rangeSampleSteps is left unset
-                    // on purpose: the coverage builder then derives it from each
-                    // zone's range so every zone samples at the same ground
-                    // resolution instead of coarsening as range grows.
                     azimuthStepDeg: props.azimuthStepDeg ?? 5,
                     elevationRingsPerZone: props.elevationRingsPerZone ?? 10,
                     rangeSampleSteps: props.rangeSampleSteps,
-                    // On by default so placed GLB objects block rays. Each ray
-                    // rejects a model on its bounding sphere first, so scenes
-                    // with no objects near the beam cost almost nothing.
                     useObjectPicking: props.useObjectPicking ?? true,
 
                     beamOpacity: props.beamOpacity ?? 0.28,
@@ -180,7 +161,6 @@ export class CesiumEntityRenderer {
                 }
             );
 
-            // Swap old -> new only after the new build succeeds
             const old = this.radarEntities.get(entity.id);
             if (old) {
                 for (const handle of old) {
@@ -199,7 +179,6 @@ export class CesiumEntityRenderer {
             this.buildInFlight.delete(entity.id);
 
             const pending = this.pendingRebuild.get(entity.id);
-
             if (pending) {
                 this.pendingRebuild.delete(entity.id);
                 this.syncRadarCoverage(pending);
@@ -208,36 +187,25 @@ export class CesiumEntityRenderer {
     }
 
     private drawRadar(entity: Entity): void {
-        const selected =
-            this.editorState.selectedEntity()?.id === entity.id;
+        const selected = this.editorState.selectedEntity()?.id === entity.id;
 
         this.viewer.entities.add({
             id: entity.id,
-
             position: Cesium.Cartesian3.fromDegrees(
                 entity.position.longitude,
                 entity.position.latitude,
                 entity.position.altitude
             ),
-
             billboard: {
-                image: EntityIconFactory.get(
-                    entity.definition.entityType
-                ),
-
+                image: EntityIconFactory.get(entity.definition.entityType),
                 width: selected ? 36 : 32,
                 height: selected ? 36 : 32,
-
                 scale: selected ? 1.08 : 1.0,
-
                 color: selected
                     ? Cesium.Color.fromCssColorString("#FFF8DC")
                     : Cesium.Color.WHITE,
-
                 disableDepthTestDistance: Number.POSITIVE_INFINITY,
-
                 heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
-
                 verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
                 horizontalOrigin: Cesium.HorizontalOrigin.CENTER
             }
@@ -251,26 +219,16 @@ export class CesiumEntityRenderer {
                 entity.position.latitude,
                 entity.position.altitude
             ),
-
             billboard: {
-                image:
-                    entity.team === "Blue"
-                        ? "assets/blue.png"
-                        : "assets/red.png",
-
-                color:
-                    entity.team === "Blue"
-                        ? Cesium.Color.fromCssColorString("#3B82F6")
-                        : Cesium.Color.WHITE,
-
+                image: entity.team === "Blue" ? "assets/blue.png" : "assets/red.png",
+                color: entity.team === "Blue"
+                    ? Cesium.Color.fromCssColorString("#3B82F6")
+                    : Cesium.Color.WHITE,
                 width: 16,
                 height: 16,
-
                 heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
-
                 verticalOrigin: Cesium.VerticalOrigin.CENTER,
                 horizontalOrigin: Cesium.HorizontalOrigin.CENTER,
-
                 disableDepthTestDistance: Number.POSITIVE_INFINITY
             }
         });

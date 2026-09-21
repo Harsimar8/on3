@@ -26,7 +26,6 @@ export interface RadarOptions {
     beamOpacity: number;
     interiorOpacity: number;
     showInterior: boolean;
-    interiorLayers: number
 }
 
 export interface RadarZoneOverride {
@@ -43,7 +42,6 @@ export interface RadarZoneOverride {
     beamOpacity?: number;
     interiorOpacity?: number;
     showInterior?: boolean;
-    interiorLayers?: number;
 }
 
 export interface RadarZoneConfig {
@@ -61,8 +59,10 @@ interface ResolvedZone {
     range: number;
     minElevationDeg: number;
     maxElevationDeg: number;
-    beamOpacity:number;
-    visible: boolean
+    beamOpacity: number;
+    interiorOpacity: number;
+    showInterior: boolean;
+    visible: boolean;
 }
 
 /** Ground heights down one azimuth, shared by every elevation ring and zone. */
@@ -70,6 +70,10 @@ interface TerrainProfile {
     azimuthDeg: number;
     horizontalDistances: number[];
     groundHeights: number[];
+}
+interface ClippedRadarGeometry {
+    positionValues: number[];
+    indices: number[];
 }
 
 /** Everything create3DRadarZones() built for one radar, so callers can clean up later. */
@@ -218,14 +222,24 @@ export class CesiumRadarCoverage {
             }
 
             visibleZones.push({
-    name: zoneConfig.name,
-    color: zoneConfig.color,
-    range: override.range ?? zoneConfig.defaultRange,
-    minElevationDeg: override.minElevationDeg ?? zoneConfig.defaultMinElevationDeg,
-    maxElevationDeg: override.maxElevationDeg ?? zoneConfig.defaultMaxElevationDeg,
-    beamOpacity: override.beamOpacity ?? options.beamOpacity,
-    visible: override.visible ?? true
-});
+                name: zoneConfig.name,
+                color: zoneConfig.color,
+                range: override.range ?? zoneConfig.defaultRange,
+                minElevationDeg: override.minElevationDeg ?? zoneConfig.defaultMinElevationDeg,
+                maxElevationDeg: override.maxElevationDeg ?? zoneConfig.defaultMaxElevationDeg,
+
+                beamOpacity: override.beamOpacity ?? options.beamOpacity,
+
+                interiorOpacity:
+                    override.interiorOpacity ??
+                    options.interiorOpacity,
+
+                showInterior:
+                    override.showInterior ??
+                    options.showInterior,
+
+                visible: override.visible ?? true
+            });
         }
 
         if (visibleZones.length === 0) {
@@ -282,17 +296,37 @@ export class CesiumRadarCoverage {
                 useObjectPicking
             );
 
-            const meshPrimitive = CesiumRadarCoverage.buildMeshPrimitive(
-    zone,
-    grid.points,
-    grid.blocked,
-    azimuthsDeg,
-    isFullCircle,
-    radarPosition,
-    entityId
-);
-            if (meshPrimitive) {
-                viewer.scene.primitives.add(meshPrimitive);
+            const clippedGeometry =
+                CesiumRadarCoverage.buildClippedRadarGeometry(
+                    grid.points,
+                    grid.blocked,
+                    azimuthsDeg,
+                    isFullCircle
+                );
+
+            if (!clippedGeometry) {
+                continue;
+            }
+
+            const meshPrimitive =
+                CesiumRadarCoverage.buildMeshPrimitive(
+                    zone,
+                    clippedGeometry,
+                    entityId
+                );
+
+            viewer.scene.primitives.add(meshPrimitive);
+
+
+            const interiorPrimitive =
+                CesiumRadarCoverage.buildInteriorPrimitive(
+                    zone,
+                    clippedGeometry,
+                    entityId
+                );
+
+            if (interiorPrimitive) {
+                viewer.scene.primitives.add(interiorPrimitive);
             }
 
             // const wireframePrimitive = CesiumRadarCoverage.buildWireframePrimitive(zone, grid.points, azimuthsDeg, isFullCircle, entityId, radarPosition);
@@ -302,7 +336,7 @@ export class CesiumRadarCoverage {
 
 
 
-            const footprintEntity = CesiumRadarCoverage.buildGroundFootprint(viewer, zone, grid.points[0], entityId);
+
 
             let rayCollection: Cesium.PolylineCollection | null = null;
             if (drawRays) {
@@ -318,12 +352,13 @@ export class CesiumRadarCoverage {
 
             handles.push({
                 dispose: () => {
+
                     if (meshPrimitive) {
                         viewer.scene.primitives.remove(meshPrimitive);
                     }
 
-                    if (footprintEntity) {
-                        viewer.entities.remove(footprintEntity);
+                    if (interiorPrimitive) {
+                        viewer.scene.primitives.remove(interiorPrimitive);
                     }
 
                     if (rayCollection) {
@@ -331,7 +366,6 @@ export class CesiumRadarCoverage {
                     }
                 }
             });
-
             viewer.scene.requestRender();
         }
 
@@ -540,356 +574,418 @@ export class CesiumRadarCoverage {
     // where they occur.
     // -------------------------------------------------------------------
 
-    private static buildMeshPrimitive(
-    zone: ResolvedZone,
-    points: Cesium.Cartesian3[][],
-    blocked: boolean[][],
-    azimuthsDeg: number[],
-    isFullCircle: boolean,
-    radarPosition: Cesium.Cartesian3,
-    entityId: string
-): Cesium.Primitive | null {
+    private static buildClippedRadarGeometry(
+        points: Cesium.Cartesian3[][],
+        blocked: boolean[][],
+        azimuthsDeg: number[],
+        isFullCircle: boolean
+    ): ClippedRadarGeometry | null {
 
-    const ringCount = points.length;
-    const azCount = azimuthsDeg.length;
+        const ringCount = points.length;
+        const azCount = azimuthsDeg.length;
 
-    if (ringCount < 2 || azCount < 2) {
-        return null;
-    }
+        if (ringCount < 2 || azCount < 2) {
+            return null;
+        }
 
-    const indexOf = (ring: number, az: number) =>
-        ring * azCount + az;
+        const indexOf = (ring: number, az: number) =>
+            ring * azCount + az;
 
-    // ---------------------------------------------------------------
-    // All actual ray-hit points become mesh vertices.
-    // These points may be:
-    //   - at maximum radar range
-    //   - stopped by terrain
-    //   - stopped by an object
-    // ---------------------------------------------------------------
+        const positionValues: number[] = [];
 
-    const positionValues: number[] = [];
+        // ---------------------------------------------------------------
+        // Original grid vertices
+        // ---------------------------------------------------------------
 
-    for (let r = 0; r < ringCount; r++) {
-        for (let a = 0; a < azCount; a++) {
+        for (let r = 0; r < ringCount; r++) {
+            for (let a = 0; a < azCount; a++) {
 
-            const p = points[r][a];
+                const p = points[r][a];
+
+                positionValues.push(
+                    p.x,
+                    p.y,
+                    p.z
+                );
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Shared terrain-cut vertices
+        // ---------------------------------------------------------------
+
+        const edgeVertexCache = new Map<string, number>();
+
+        const addBoundaryVertex = (
+            indexA: number,
+            indexB: number
+        ): number => {
+
+            const minIndex = Math.min(indexA, indexB);
+            const maxIndex = Math.max(indexA, indexB);
+
+            const key = `${minIndex}:${maxIndex}`;
+
+            const existing = edgeVertexCache.get(key);
+
+            if (existing !== undefined) {
+                return existing;
+            }
+
+            const pointA = new Cesium.Cartesian3(
+                positionValues[indexA * 3],
+                positionValues[indexA * 3 + 1],
+                positionValues[indexA * 3 + 2]
+            );
+
+            const pointB = new Cesium.Cartesian3(
+                positionValues[indexB * 3],
+                positionValues[indexB * 3 + 1],
+                positionValues[indexB * 3 + 2]
+            );
+
+            // Phase 1 terrain boundary approximation.
+            const boundaryPoint = Cesium.Cartesian3.lerp(
+                pointA,
+                pointB,
+                0.5,
+                new Cesium.Cartesian3()
+            );
+
+            const newIndex = positionValues.length / 3;
 
             positionValues.push(
-                p.x,
-                p.y,
-                p.z
+                boundaryPoint.x,
+                boundaryPoint.y,
+                boundaryPoint.z
             );
+
+            edgeVertexCache.set(key, newIndex);
+
+            return newIndex;
+        };
+
+        const indices: number[] = [];
+
+        const azStepCount =
+            isFullCircle
+                ? azCount
+                : azCount - 1;
+
+        // ---------------------------------------------------------------
+        // Terrain-clipped cells
+        // ---------------------------------------------------------------
+
+        for (let r = 0; r < ringCount - 1; r++) {
+
+            for (let a = 0; a < azStepCount; a++) {
+
+                const aNext = (a + 1) % azCount;
+
+                const cellIndices = [
+                    indexOf(r, a),
+                    indexOf(r + 1, a),
+                    indexOf(r + 1, aNext),
+                    indexOf(r, aNext)
+                ];
+
+                const cellBlocked = [
+                    blocked[r][a],
+                    blocked[r + 1][a],
+                    blocked[r + 1][aNext],
+                    blocked[r][aNext]
+                ];
+
+                // -------------------------------------------------------
+                // Entirely blocked
+                // -------------------------------------------------------
+
+                if (
+                    cellBlocked[0] &&
+                    cellBlocked[1] &&
+                    cellBlocked[2] &&
+                    cellBlocked[3]
+                ) {
+                    continue;
+                }
+
+                // -------------------------------------------------------
+                // Entirely visible
+                // -------------------------------------------------------
+
+                if (
+                    !cellBlocked[0] &&
+                    !cellBlocked[1] &&
+                    !cellBlocked[2] &&
+                    !cellBlocked[3]
+                ) {
+
+                    indices.push(
+                        cellIndices[0],
+                        cellIndices[1],
+                        cellIndices[2],
+
+                        cellIndices[0],
+                        cellIndices[2],
+                        cellIndices[3]
+                    );
+
+                    continue;
+                }
+
+                // -------------------------------------------------------
+                // Mixed cell
+                // -------------------------------------------------------
+
+                const polygon: number[] = [];
+
+                for (let edge = 0; edge < 4; edge++) {
+
+                    const nextEdge = (edge + 1) % 4;
+
+                    const currentIndex = cellIndices[edge];
+                    const nextIndex = cellIndices[nextEdge];
+
+                    const currentBlocked = cellBlocked[edge];
+                    const nextBlocked = cellBlocked[nextEdge];
+
+                    // Keep visible corner.
+                    if (!currentBlocked) {
+                        polygon.push(currentIndex);
+                    }
+
+                    // Terrain boundary.
+                    if (currentBlocked !== nextBlocked) {
+
+                        const boundaryIndex =
+                            addBoundaryVertex(
+                                currentIndex,
+                                nextIndex
+                            );
+
+                        polygon.push(boundaryIndex);
+                    }
+                }
+
+                // Remove consecutive duplicates.
+                const cleanPolygon: number[] = [];
+
+                for (const index of polygon) {
+
+                    if (
+                        cleanPolygon.length === 0 ||
+                        cleanPolygon[cleanPolygon.length - 1] !== index
+                    ) {
+                        cleanPolygon.push(index);
+                    }
+                }
+
+                if (
+                    cleanPolygon.length > 1 &&
+                    cleanPolygon[0] ===
+                    cleanPolygon[cleanPolygon.length - 1]
+                ) {
+                    cleanPolygon.pop();
+                }
+
+                if (cleanPolygon.length < 3) {
+                    continue;
+                }
+
+                // Triangulate the clipped polygon.
+                for (
+                    let i = 1;
+                    i < cleanPolygon.length - 1;
+                    i++
+                ) {
+
+                    indices.push(
+                        cleanPolygon[0],
+                        cleanPolygon[i],
+                        cleanPolygon[i + 1]
+                    );
+                }
+            }
         }
-    }
 
-    const indices: number[] = [];
-
-    const azStepCount =
-        isFullCircle
-            ? azCount
-            : azCount - 1;
-
-    // ---------------------------------------------------------------
-    // Helper:
-    // Only connect nearby ray endpoints.
-    //
-    // If terrain suddenly blocks a ray, the blocked endpoint is much
-    // closer to the radar than its neighbour. We do NOT stretch a
-    // triangle all the way across that terrain gap.
-    // ---------------------------------------------------------------
-
-    const triangleIsValid = (
-        p0: Cesium.Cartesian3,
-        p1: Cesium.Cartesian3,
-        p2: Cesium.Cartesian3
-    ): boolean => {
-
-        const d0 = Cesium.Cartesian3.distance(
-            radarPosition,
-            p0
-        );
-
-        const d1 = Cesium.Cartesian3.distance(
-            radarPosition,
-            p1
-        );
-
-        const d2 = Cesium.Cartesian3.distance(
-            radarPosition,
-            p2
-        );
-
-        const maxDistance = Math.max(
-            d0,
-            d1,
-            d2
-        );
-
-        const minDistance = Math.min(
-            d0,
-            d1,
-            d2
-        );
-
-        // Prevent a triangle from stretching from a nearby
-        // terrain-blocked ray to a far-away unobstructed ray.
-        return (
-            maxDistance <=
-            minDistance * MAX_NEIGHBOUR_RANGE_RATIO
-        );
-    };
-
-    // ---------------------------------------------------------------
-    // Build the actual terrain-following surface.
-    //
-    // Each grid cell is only an internal implementation detail.
-    // What the user sees is one continuous triangulated surface,
-    // NOT a collection of visible squares.
-    // ---------------------------------------------------------------
-
-    for (let r = 0; r < ringCount - 1; r++) {
-
-        for (let a = 0; a < azStepCount; a++) {
-
-            const aNext = (a + 1) % azCount;
-
-            const i00 = indexOf(r, a);
-            const i01 = indexOf(r, aNext);
-
-            const i10 = indexOf(r + 1, a);
-            const i11 = indexOf(r + 1, aNext);
-
-            const p00 = points[r][a];
-            const p01 = points[r][aNext];
-
-            const p10 = points[r + 1][a];
-            const p11 = points[r + 1][aNext];
-
-            const blocked00 = blocked[r][a];
-const blocked01 = blocked[r][aNext];
-const blocked10 = blocked[r + 1][a];
-const blocked11 = blocked[r + 1][aNext];
-
-const allBlocked =
-    blocked00 &&
-    blocked01 &&
-    blocked10 &&
-    blocked11;
-
-if (!allBlocked) {
-    indices.push(
-        i00,
-        i10,
-        i11,
-
-        i00,
-        i11,
-        i01
-    );
-}
+        if (indices.length === 0) {
+            return null;
         }
+
+        return {
+            positionValues,
+            indices
+        };
     }
+    private static buildMeshPrimitive(
+        zone: ResolvedZone,
+        geometryData: ClippedRadarGeometry,
+        entityId: string
+    ): Cesium.Primitive {
 
-    if (indices.length === 0) {
-        return null;
-    }
+        const attributes =
+            new Cesium.GeometryAttributes();
 
-    // ---------------------------------------------------------------
-    // Geometry
-    // ---------------------------------------------------------------
+        attributes.position =
+            new Cesium.GeometryAttribute({
 
-    const meshAttributes =
-        new Cesium.GeometryAttributes();
+                componentDatatype:
+                    Cesium.ComponentDatatype.DOUBLE,
 
-    meshAttributes.position =
-        new Cesium.GeometryAttribute({
+                componentsPerAttribute: 3,
 
-            componentDatatype:
-                Cesium.ComponentDatatype.DOUBLE,
+                values:
+                    new Float64Array(
+                        geometryData.positionValues
+                    )
+            });
 
-            componentsPerAttribute: 3,
+        const geometry =
+            new Cesium.Geometry({
 
-            values:
-                new Float64Array(positionValues)
-        });
+                attributes,
 
-    const geometry =
-        new Cesium.Geometry({
+                indices:
+                    new Uint32Array(
+                        geometryData.indices
+                    ),
 
-            attributes:
-                meshAttributes,
+                primitiveType:
+                    Cesium.PrimitiveType.TRIANGLES,
 
-            indices:
-                new Uint32Array(indices),
+                boundingSphere:
+                    Cesium.BoundingSphere.fromVertices(
+                        geometryData.positionValues
+                    )
+            });
 
-            primitiveType:
-                Cesium.PrimitiveType.TRIANGLES,
+        const instance =
+            new Cesium.GeometryInstance({
 
-            boundingSphere:
-                Cesium.BoundingSphere.fromVertices(
-                    positionValues
-                )
-        });
+                geometry,
 
-    // ---------------------------------------------------------------
-    // Shaded radar volume
-    // ---------------------------------------------------------------
+                id: entityId,
 
-    const instance =
-        new Cesium.GeometryInstance({
+                attributes: {
 
-            geometry,
-
-            id: {
-                radarParentId: entityId
-            },
-
-            attributes: {
-
-                color:
-                    Cesium.ColorGeometryInstanceAttribute
-                        .fromColor(
+                    color:
+                        Cesium.ColorGeometryInstanceAttribute.fromColor(
                             zone.color.withAlpha(
-    Cesium.Math.clamp(
-        zone.beamOpacity ?? 0.28,
-        0.0,
-        1.0
-    )
-)
-                        )
-            }
-        });
-
-    return new Cesium.Primitive({
-
-        geometryInstances:
-            instance,
-
-        appearance:
-    new Cesium.PerInstanceColorAppearance({
-        flat: true,
-        translucent: true,
-        closed: false
-    }),
-
-        asynchronous: false
-    });
-}
-
-private buildInteriorPrimitive(
-    points: Cesium.Cartesian3[][],
-    color: Cesium.Color,
-    opacity: number
-): Cesium.Primitive | undefined {
-
-    if (points.length < 2) {
-        return undefined;
-    }
-
-    const positions: Cesium.Cartesian3[] = [];
-    const indices: number[] = [];
-
-    const rows = points.length;
-    const cols = points[0]?.length ?? 0;
-
-    if (cols < 2) {
-        return undefined;
-    }
-
-    for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-            const p = points[r][c];
-
-            if (!p) {
-                positions.push(
-                    Cesium.Cartesian3.ZERO
-                );
-            } else {
-                positions.push(p);
-            }
-        }
-    }
-
-    for (let r = 0; r < rows - 1; r++) {
-        for (let c = 0; c < cols - 1; c++) {
-
-            const i00 = r * cols + c;
-            const i10 = (r + 1) * cols + c;
-            const i11 = (r + 1) * cols + (c + 1);
-            const i01 = r * cols + (c + 1);
-
-            indices.push(
-                i00,
-                i10,
-                i11,
-
-                i00,
-                i11,
-                i01
-            );
-        }
-    }
-
-    if (indices.length === 0) {
-        return undefined;
-    }
-
-    const geometry = new Cesium.Geometry({
-        attributes: (() => {
-    const attributes = new Cesium.GeometryAttributes();
-
-    attributes.position = new Cesium.GeometryAttribute({
-        componentDatatype: Cesium.ComponentDatatype.DOUBLE,
-        componentsPerAttribute: 3,
-        values: Cesium.Cartesian3.packArray(positions)
-    });
-
-    return attributes;
-})(),
-
-        indices: new Uint32Array(indices),
-
-        primitiveType:
-            Cesium.PrimitiveType.TRIANGLES,
-
-        boundingSphere:
-            Cesium.BoundingSphere.fromVertices(
-                Cesium.Cartesian3.packArray(positions)
-            )
-    });
-
-    const instance =
-        new Cesium.GeometryInstance({
-            geometry,
-
-            attributes: {
-                color:
-                    Cesium.ColorGeometryInstanceAttribute.fromColor(
-                        color.withAlpha(
-                            Cesium.Math.clamp(
-                                opacity,
-                                0.0,
-                                1.0
+                                Cesium.Math.clamp(
+                                    zone.beamOpacity ?? 0.28,
+                                    0.0,
+                                    1.0
+                                )
                             )
                         )
-                    )
-            }
+                }
+            });
+
+        return new Cesium.Primitive({
+
+            geometryInstances:
+                instance,
+
+            appearance:
+                new Cesium.PerInstanceColorAppearance({
+
+                    flat: true,
+
+                    translucent: true,
+
+                    closed: false
+                }),
+
+            asynchronous: false
         });
+    }
 
-    return new Cesium.Primitive({
-        geometryInstances: instance,
+    private static buildInteriorPrimitive(
+        zone: ResolvedZone,
+        geometryData: ClippedRadarGeometry,
+        entityId: string
+    ): Cesium.Primitive | null {
 
-        appearance:
-            new Cesium.PerInstanceColorAppearance({
-                flat: true,
-                translucent: true,
-                closed: false
-            }),
+        if (!zone.showInterior) {
+            return null;
+        }
 
-        asynchronous: false
-    });
-}
+        const attributes =
+            new Cesium.GeometryAttributes();
+
+        attributes.position =
+            new Cesium.GeometryAttribute({
+
+                componentDatatype:
+                    Cesium.ComponentDatatype.DOUBLE,
+
+                componentsPerAttribute: 3,
+
+                values:
+                    new Float64Array(
+                        geometryData.positionValues
+                    )
+            });
+
+        const geometry =
+            new Cesium.Geometry({
+
+                attributes,
+
+                indices:
+                    new Uint32Array(
+                        geometryData.indices
+                    ),
+
+                primitiveType:
+                    Cesium.PrimitiveType.TRIANGLES,
+
+                boundingSphere:
+                    Cesium.BoundingSphere.fromVertices(
+                        geometryData.positionValues
+                    )
+            });
+
+        const instance =
+            new Cesium.GeometryInstance({
+
+                geometry,
+
+                id: entityId,
+
+                attributes: {
+
+                    color:
+                        Cesium.ColorGeometryInstanceAttribute.fromColor(
+                            zone.color.withAlpha(
+                                Cesium.Math.clamp(
+                                    zone.interiorOpacity,
+                                    0.0,
+                                    1.0
+                                )
+                            )
+                        )
+                }
+            });
+
+        return new Cesium.Primitive({
+
+            geometryInstances:
+                instance,
+
+            appearance:
+                new Cesium.PerInstanceColorAppearance({
+
+                    flat: true,
+
+                    translucent: true,
+
+                    closed: false
+                }),
+
+            asynchronous: false
+        });
+    }
     // -------------------------------------------------------------------
     // Wireframe overlay: circumferential ring lines + radial ribs through
     // the same grid, drawn in an opaque, slightly stronger version of the
@@ -1005,38 +1101,6 @@ private buildInteriorPrimitive(
     // top-down / low-zoom view too.
     // -------------------------------------------------------------------
 
-    private static buildGroundFootprint(
-        viewer: Cesium.Viewer,
-        zone: ResolvedZone,
-        ring0Points: Cesium.Cartesian3[],
-        entityId: string
-    ): Cesium.Entity | null {
-
-        if (!ring0Points || ring0Points.length < 3) {
-            return null;
-        }
-
-        const hierarchy = ring0Points.map(p => {
-            const c = Cesium.Cartographic.fromCartesian(p);
-            // small vertical lift to avoid z-fighting with the terrain mesh
-            return Cesium.Cartesian3.fromRadians(c.longitude, c.latitude, c.height + 0.5);
-        });
-
-        const footprint = viewer.entities.add({
-            name: `${zone.name} ground footprint`,
-            polygon: {
-                hierarchy,
-                perPositionHeight: true,
-                material: zone.color.withAlpha(0.15),
-                outline: true,
-                outlineColor: zone.color.withAlpha(0.6)
-            }
-        });
-
-        (footprint as any).radarParentId = entityId;
-
-        return footprint;
-    }
 
     // -------------------------------------------------------------------
     // Optional debug ray overlay (toggle: "Draw 3D Rays"). Reuses the same
