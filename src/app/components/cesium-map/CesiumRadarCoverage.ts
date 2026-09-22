@@ -346,7 +346,7 @@ export class CesiumRadarCoverage {
         for (let i = 1; i < horizontalDistances.length; i++) {
             const dist = horizontalDistances[i];
             if (dist > maxRange) break;
-            if (dist < 10) continue;
+            
 
             const groundH = groundHeights[i];
             const heightDiff = groundH - radarHeight;
