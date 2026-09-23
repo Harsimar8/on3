@@ -75,7 +75,7 @@ export interface RadarCoverageHandle {
 // CesiumRadarCoverage (Multi-Ring Elevation Wedges with Terrain Masking)
 // =============================================================================
 
-const TERRAIN_SAMPLE_SPACING_M = 20;
+const TERRAIN_SAMPLE_SPACING_M = 5;
 
 export class CesiumRadarCoverage {
     public static readonly DEFAULT_3D_ZONES: RadarZoneConfig[] = [
@@ -121,7 +121,7 @@ export class CesiumRadarCoverage {
             mastHeight = 0,
             sectorStartDeg = 0,
             sectorSweepDeg = 360,
-            azimuthStepDeg = 5,
+            azimuthStepDeg = 2,
             rangeSampleSteps,
             elevationRingsPerZone = 8,
             zoneOverrides = {}
@@ -174,8 +174,10 @@ export class CesiumRadarCoverage {
             for (let r = 0; r < rings; r++) {
                 const ringMin = minEl + r * ringSpan;
                 const ringMax = minEl + (r + 1) * ringSpan;
-                // Slight color variation or gradient alpha per ring for distinction
-                const ringColor = zoneConfig.color.withAlpha(0.8 - (r * 0.15));
+                // Every ring of a zone shares one colour and one opacity, so the
+                // stack reads as a single translucent volume rather than fading
+                // out with height. Alpha comes from beamOpacity at draw time.
+                const ringColor = zoneConfig.color;
 
                 subZones.push({
                     name: `${zoneConfig.name} (Ring ${r + 1})`,
@@ -183,7 +185,7 @@ export class CesiumRadarCoverage {
                     range: baseRange,
                     minElevationDeg: ringMin,
                     maxElevationDeg: ringMax,
-                    beamOpacity: (override.beamOpacity ?? (options.beamOpacity ?? 0.35)) - (r * 0.05),
+                    beamOpacity: override.beamOpacity ?? (options.beamOpacity ?? 0.35),
                     interiorOpacity: override.interiorOpacity ?? (options.interiorOpacity ?? 0.15),
                     showInterior: override.showInterior ?? (options.showInterior ?? true),
                     visible: true,
@@ -195,6 +197,46 @@ export class CesiumRadarCoverage {
 
         if (subZones.length === 0) return handles;
 
+        // A terrain profile depends only on the azimuth fan and how far out we walk it -
+        // not on the ring's elevation bounds. Every ring of every zone was therefore
+        // re-sampling the same ground. Sample each distinct fan once here, out to the
+        // largest range any of its rings needs and at the finest spacing any of them
+        // asked for, then let the rings below read from the result.
+        const profileGroups = new Map<string, { maxRange: number; spacing: number }>();
+        for (const zone of subZones) {
+            const key = `${zone.azimuthStartDeg}|${zone.azimuthWidthDeg}`;
+            const spacing = rangeSampleSteps
+                ? zone.range / Math.max(2, rangeSampleSteps)
+                : TERRAIN_SAMPLE_SPACING_M;
+
+            const group = profileGroups.get(key);
+            if (group) {
+                group.maxRange = Math.max(group.maxRange, zone.range);
+                group.spacing = Math.min(group.spacing, spacing);
+            } else {
+                profileGroups.set(key, { maxRange: zone.range, spacing });
+            }
+        }
+
+        const profilesByFan = new Map<string, TerrainProfile[]>();
+        for (const [key, group] of profileGroups) {
+            const [fanStartDeg, fanWidthDeg] = key.split("|").map(Number);
+            const fanAzimuthsDeg = CesiumRadarCoverage.buildAzimuthList(
+                fanStartDeg,
+                fanWidthDeg,
+                azimuthStepDeg
+            );
+
+            profilesByFan.set(key, await CesiumRadarCoverage.buildTerrainProfiles(
+                terrainProvider,
+                radarPosition,
+                enuMatrix,
+                fanAzimuthsDeg,
+                group.maxRange,
+                group.spacing
+            ));
+        }
+
         // Build Cylindrical Elevation Rings with Terrain Line-of-Sight Clipping
         for (const zone of subZones) {
             const azimuthsDeg = CesiumRadarCoverage.buildAzimuthList(
@@ -203,18 +245,9 @@ export class CesiumRadarCoverage {
                 azimuthStepDeg
             );
 
-            const profileSpacing = rangeSampleSteps
-                ? zone.range / Math.max(2, rangeSampleSteps)
-                : TERRAIN_SAMPLE_SPACING_M;
-
-            const profiles = await CesiumRadarCoverage.buildTerrainProfiles(
-                terrainProvider,
-                radarPosition,
-                enuMatrix,
-                azimuthsDeg,
-                zone.range,
-                profileSpacing
-            );
+            // Shared profile may run past this ring's range; getTerrainBlockedRange
+            // stops at zone.range, so the ring sees exactly what it saw before.
+            const profiles = profilesByFan.get(`${zone.azimuthStartDeg}|${zone.azimuthWidthDeg}`)!;
 
             // Compute true line-of-sight range per azimuth tailored to this ring's elevation bounds
             const effectiveRanges = profiles.map(profile =>
