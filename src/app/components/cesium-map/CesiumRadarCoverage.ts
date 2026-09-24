@@ -47,12 +47,15 @@ export interface RadarZoneConfig {
     defaultMaxElevationDeg: number;
 }
 
+// One entry per ZONE now (not per ring). The rings live inside it as
+// ringEdgesDeg: N rings -> N + 1 edge angles, bottom to top.
 interface ResolvedZone {
     name: string;
     color: Cesium.Color;
     range: number;
     minElevationDeg: number;
     maxElevationDeg: number;
+    ringEdgesDeg: number[];
     beamOpacity: number;
     interiorOpacity: number;
     showInterior: boolean;
@@ -72,7 +75,7 @@ export interface RadarCoverageHandle {
 }
 
 // =============================================================================
-// CesiumRadarCoverage (Multi-Ring Elevation Wedges with Terrain Masking)
+// CesiumRadarCoverage (one connected shell per zone, stepped by terrain)
 // =============================================================================
 
 const TERRAIN_SAMPLE_SPACING_M = 5;
@@ -157,64 +160,60 @@ export class CesiumRadarCoverage {
         (marker as any).radarParentId = entityId;
         handles.push({ dispose: () => viewer.entities.remove(marker) });
 
-        // Resolve Zones & Sub-divide into Elevation Rings
-        const subZones: ResolvedZone[] = [];
+        // Resolve zones. Each zone keeps its rings as a list of edge angles
+        // instead of becoming N separate sub-zones.
+        const zones: ResolvedZone[] = [];
         for (const zoneConfig of CesiumRadarCoverage.DEFAULT_3D_ZONES) {
             const override = zoneOverrides[zoneConfig.name] ?? {};
             if (!(override.visible ?? true)) continue;
 
-            const baseRange = override.range ?? zoneConfig.defaultRange;
             const minEl = override.minElevationDeg ?? zoneConfig.defaultMinElevationDeg;
             const maxEl = override.maxElevationDeg ?? zoneConfig.defaultMaxElevationDeg;
-            const totalSpan = maxEl - minEl;
             const rings = Math.max(1, elevationRingsPerZone);
-            const ringSpan = totalSpan / rings;
+            const ringSpan = (maxEl - minEl) / rings;
 
-            // Create sub-rings vertically stacked for this zone
-            for (let r = 0; r < rings; r++) {
-                const ringMin = minEl + r * ringSpan;
-                const ringMax = minEl + (r + 1) * ringSpan;
-                // Every ring of a zone shares one colour and one opacity, so the
-                // stack reads as a single translucent volume rather than fading
-                // out with height. Alpha comes from beamOpacity at draw time.
-                const ringColor = zoneConfig.color;
-
-                subZones.push({
-                    name: `${zoneConfig.name} (Ring ${r + 1})`,
-                    color: ringColor,
-                    range: baseRange,
-                    minElevationDeg: ringMin,
-                    maxElevationDeg: ringMax,
-                    beamOpacity: override.beamOpacity ?? (options.beamOpacity ?? 0.35),
-                    interiorOpacity: override.interiorOpacity ?? (options.interiorOpacity ?? 0.15),
-                    showInterior: override.showInterior ?? (options.showInterior ?? true),
-                    visible: true,
-                    azimuthStartDeg: override.azimuthStartDeg ?? sectorStartDeg,
-                    azimuthWidthDeg: override.azimuthWidthDeg ?? sectorSweepDeg
-                });
+            const ringEdgesDeg: number[] = [];
+            for (let k = 0; k <= rings; k++) {
+                ringEdgesDeg.push(minEl + k * ringSpan);
             }
+
+            zones.push({
+                name: zoneConfig.name,
+                color: override.color
+                    ? Cesium.Color.fromCssColorString(override.color)
+                    : zoneConfig.color,
+                range: override.range ?? zoneConfig.defaultRange,
+                minElevationDeg: minEl,
+                maxElevationDeg: maxEl,
+                ringEdgesDeg,
+                beamOpacity: override.beamOpacity ?? (options.beamOpacity ?? 0.35),
+                interiorOpacity: override.interiorOpacity ?? (options.interiorOpacity ?? 0.15),
+                showInterior: override.showInterior ?? (options.showInterior ?? true),
+                visible: true,
+                azimuthStartDeg: override.azimuthStartDeg ?? sectorStartDeg,
+                azimuthWidthDeg: override.azimuthWidthDeg ?? sectorSweepDeg
+            });
         }
 
-        if (subZones.length === 0) return handles;
+        if (zones.length === 0) return handles;
 
-        // A terrain profile depends only on the azimuth fan and how far out we walk it -
-        // not on the ring's elevation bounds. Every ring of every zone was therefore
-        // re-sampling the same ground. Sample each distinct fan once here, out to the
-        // largest range any of its rings needs and at the finest spacing any of them
-        // asked for, then let the rings below read from the result.
+        // Sample each distinct azimuth fan once, out to the largest range and at
+        // the finest spacing any zone on that fan needs. Rings never need their
+        // own sampling: the elevation check reuses the same ground heights.
+        const fanKey = (z: ResolvedZone) => `${z.azimuthStartDeg}|${z.azimuthWidthDeg}`;
+
         const profileGroups = new Map<string, { maxRange: number; spacing: number }>();
-        for (const zone of subZones) {
-            const key = `${zone.azimuthStartDeg}|${zone.azimuthWidthDeg}`;
+        for (const zone of zones) {
             const spacing = rangeSampleSteps
                 ? zone.range / Math.max(2, rangeSampleSteps)
                 : TERRAIN_SAMPLE_SPACING_M;
 
-            const group = profileGroups.get(key);
+            const group = profileGroups.get(fanKey(zone));
             if (group) {
                 group.maxRange = Math.max(group.maxRange, zone.range);
                 group.spacing = Math.min(group.spacing, spacing);
             } else {
-                profileGroups.set(key, { maxRange: zone.range, spacing });
+                profileGroups.set(fanKey(zone), { maxRange: zone.range, spacing });
             }
         }
 
@@ -237,36 +236,34 @@ export class CesiumRadarCoverage {
             ));
         }
 
-        // Build Cylindrical Elevation Rings with Terrain Line-of-Sight Clipping
-        for (const zone of subZones) {
-            const azimuthsDeg = CesiumRadarCoverage.buildAzimuthList(
-                zone.azimuthStartDeg,
-                zone.azimuthWidthDeg,
-                azimuthStepDeg
+        // Build ONE connected shell per zone
+        for (const zone of zones) {
+            const profiles = profilesByFan.get(fanKey(zone))!;
+            const azimuthsDeg = profiles.map(p => p.azimuthDeg);
+
+            // ranges[azimuthIndex][ringIndex] = how far that ring reaches in that direction
+            const ringBottomsDeg = zone.ringEdgesDeg.slice(0, -1);
+            const ranges: number[][] = profiles.map(profile =>
+                ringBottomsDeg.map(bottomDeg =>
+                    CesiumRadarCoverage.getTerrainBlockedRange(profile, radarHeight, zone.range, bottomDeg)
+                )
             );
 
-            // Shared profile may run past this ring's range; getTerrainBlockedRange
-            // stops at zone.range, so the ring sees exactly what it saw before.
-            const profiles = profilesByFan.get(`${zone.azimuthStartDeg}|${zone.azimuthWidthDeg}`)!;
+            const closeLoop = zone.azimuthWidthDeg >= 360;
 
-            // Compute true line-of-sight range per azimuth tailored to this ring's elevation bounds
-            const effectiveRanges = profiles.map(profile =>
-                CesiumRadarCoverage.getTerrainBlockedRange(profile, radarHeight, zone.range, zone.minElevationDeg)
-            );
-
-            // Build custom primitive volume matching directional terrain constraints
-            const radarPrimitive = CesiumRadarCoverage.buildRadarVolumePrimitive(
+            const shell = CesiumRadarCoverage.buildZoneShellPrimitive(
                 viewer,
                 radarPosition,
                 enuMatrix,
                 zone,
                 azimuthsDeg,
-                effectiveRanges,
+                ranges,
+                closeLoop,
                 entityId
             );
 
-            if (radarPrimitive) {
-                handles.push({ dispose: () => viewer.scene.primitives.remove(radarPrimitive) });
+            if (shell) {
+                handles.push({ dispose: () => viewer.scene.primitives.remove(shell) });
             }
         }
 
@@ -364,96 +361,157 @@ export class CesiumRadarCoverage {
 
     // -------------------------------------------------------------------
     // 5. Terrain Line-of-Sight Check: getTerrainBlockedRange
+    //
+    // Walks out along the ground profile and finds the EXACT distance where a
+    // beam tilted at elevationDeg first touches the ground.
+    //   beam height at distance d = radarHeight + d * tan(elevation)
+    //   "clearance" = ground height - beam height   (> 0 means ground is above the beam)
+    // When clearance changes from <= 0 to > 0 between two samples, the beam hit the
+    // ground somewhere between them; linear interpolation finds that point.
+    // No margin, no minimum, no skipped ground: the pin lands on the terrain itself.
     // -------------------------------------------------------------------
     private static getTerrainBlockedRange(
         profile: TerrainProfile,
         radarHeight: number,
         maxRange: number,
-        minElevationDeg: number
+        elevationDeg: number
     ): number {
         const { horizontalDistances, groundHeights } = profile;
-        let maxElevationAngle = -Infinity;
-        let blockedRange = maxRange;
-        const minElevationRad = Cesium.Math.toRadians(minElevationDeg);
+        const tanEl = Math.tan(Cesium.Math.toRadians(elevationDeg));
+
+        // At distance 0 the beam starts at the radar itself
+        let prevDist = 0;
+        let prevClearance = 0;
 
         for (let i = 1; i < horizontalDistances.length; i++) {
             const dist = horizontalDistances[i];
             if (dist > maxRange) break;
-            
 
-            const groundH = groundHeights[i];
-            const heightDiff = groundH - radarHeight;
-            const elevationAngle = Math.atan2(heightDiff, dist);
+            const beamHeight = radarHeight + dist * tanEl;
+            const clearance = groundHeights[i] - beamHeight;
 
-            // If the terrain rises higher than the ring's minimum elevation angle, it blocks the beam
-            if (elevationAngle > minElevationRad && elevationAngle > maxElevationAngle) {
-                maxElevationAngle = elevationAngle;
-                if (heightDiff > 0) {
-                    blockedRange = Math.max(100, dist - 50);
-                    break;
-                }
+            if (clearance > 0) {
+                // Beam went into the ground between prevDist and dist - find the exact point
+                const t = prevClearance >= 0 ? 0 : -prevClearance / (clearance - prevClearance);
+                return prevDist + t * (dist - prevDist);
             }
+
+            prevDist = dist;
+            prevClearance = clearance;
         }
-        return blockedRange;
+        return maxRange;
     }
 
     // -------------------------------------------------------------------
-    // 6. Volumetric Mesh Primitive Builder: buildRadarVolumePrimitive
+    // 6. Connected Shell Builder: buildZoneShellPrimitive
+    //
+    // Draws only the OUTSIDE of the zone:
+    //   - floor   : bottom of the lowest ring
+    //   - roof    : top of the highest ring
+    //   - walls   : outer wall of every ring
+    //   - steps   : joins ring r to ring r+1, ONLY where their ranges differ
+    //   - sides   : two end walls, only when the sector is not a full circle
+    // No inner floors/roofs between rings -> no stacked-layer lines.
     // -------------------------------------------------------------------
-    private static buildRadarVolumePrimitive(
+    private static buildZoneShellPrimitive(
         viewer: Cesium.Viewer,
         radarPosition: Cesium.Cartesian3,
         enuMatrix: Cesium.Matrix4,
         zone: ResolvedZone,
         azimuthsDeg: number[],
-        effectiveRanges: number[],
+        ranges: number[][],
+        closeLoop: boolean,
         entityId: string
     ): Cesium.Primitive | null {
-        const numAzimuths = azimuthsDeg.length;
-        if (numAzimuths < 2) return null;
+        const nAz = azimuthsDeg.length;
+        const edges = zone.ringEdgesDeg;
+        const nRings = edges.length - 1;
+        if (nAz < 2 || nRings < 1) return null;
 
         const positions: number[] = [];
         const indices: number[] = [];
 
-        const maxRad = Cesium.Math.toRadians(zone.maxElevationDeg);
-        const minRad = Cesium.Math.toRadians(zone.minElevationDeg);
+        // Pre-compute trig once
+        const sinAz = azimuthsDeg.map(a => Math.sin(Cesium.Math.toRadians(a)));
+        const cosAz = azimuthsDeg.map(a => Math.cos(Cesium.Math.toRadians(a)));
+        const sinEl = edges.map(e => Math.sin(Cesium.Math.toRadians(e)));
+        const cosEl = edges.map(e => Math.cos(Cesium.Math.toRadians(e)));
 
-        const apexIdx = 0;
+        const scratchLocal = new Cesium.Cartesian3();
+        const scratchWorld = new Cesium.Cartesian3();
+
+        // Adds one pin at (direction azIdx, edge angle edgeIdx, distance range)
+        // and returns its index.
+        const addPin = (azIdx: number, edgeIdx: number, range: number): number => {
+            const horiz = range * cosEl[edgeIdx];
+            scratchLocal.x = sinAz[azIdx] * horiz;
+            scratchLocal.y = cosAz[azIdx] * horiz;
+            scratchLocal.z = range * sinEl[edgeIdx];
+            Cesium.Matrix4.multiplyByPoint(enuMatrix, scratchLocal, scratchWorld);
+            positions.push(scratchWorld.x, scratchWorld.y, scratchWorld.z);
+            return positions.length / 3 - 1;
+        };
+
+        const addQuad = (a: number, b: number, c: number, d: number) => {
+            indices.push(a, b, c, a, c, d);
+        };
+
+        // Pin 0 = radar
         positions.push(radarPosition.x, radarPosition.y, radarPosition.z);
+        const apex = 0;
 
-        for (let i = 0; i < numAzimuths; i++) {
-            const azDeg = azimuthsDeg[i];
-            const range = effectiveRanges[i];
-            const azRad = Cesium.Math.toRadians(azDeg);
+        // Full circle: also join the last direction back to the first (no gap)
+        const pairCount = closeLoop ? nAz : nAz - 1;
 
-            const cosAz = Math.cos(azRad);
-            const sinAz = Math.sin(azRad);
+        for (let i = 0; i < pairCount; i++) {
+            const j = (i + 1) % nAz;
 
-            const botDistHoriz = range * Math.cos(minRad);
-            const botHeight = range * Math.sin(minRad);
-            const localBot = new Cesium.Cartesian3(sinAz * botDistHoriz, cosAz * botDistHoriz, botHeight);
-            
-            const topDistHoriz = range * Math.cos(maxRad);
-            const topHeight = range * Math.sin(maxRad);
-            const localTop = new Cesium.Cartesian3(sinAz * topDistHoriz, cosAz * topDistHoriz, topHeight);
+            // Floor (bottom of ring 0)
+            const f0 = addPin(i, 0, ranges[i][0]);
+            const f1 = addPin(j, 0, ranges[j][0]);
+            indices.push(apex, f0, f1);
 
-            const worldBot = Cesium.Matrix4.multiplyByPoint(enuMatrix, localBot, new Cesium.Cartesian3());
-            const worldTop = Cesium.Matrix4.multiplyByPoint(enuMatrix, localTop, new Cesium.Cartesian3());
+            // Roof (top of the last ring)
+            const last = nRings - 1;
+            const r0 = addPin(i, nRings, ranges[i][last]);
+            const r1 = addPin(j, nRings, ranges[j][last]);
+            indices.push(apex, r1, r0);
 
-            positions.push(worldBot.x, worldBot.y, worldBot.z);
-            positions.push(worldTop.x, worldTop.y, worldTop.z);
+            for (let r = 0; r < nRings; r++) {
+                // Outer wall of ring r
+                const wb0 = addPin(i, r, ranges[i][r]);
+                const wt0 = addPin(i, r + 1, ranges[i][r]);
+                const wb1 = addPin(j, r, ranges[j][r]);
+                const wt1 = addPin(j, r + 1, ranges[j][r]);
+                addQuad(wb0, wt0, wt1, wb1);
+
+                // Step from ring r up to ring r+1 - only where the hill made them differ
+                if (r < last) {
+                    const changedHere = ranges[i][r] !== ranges[i][r + 1];
+                    const changedNext = ranges[j][r] !== ranges[j][r + 1];
+                    if (changedHere || changedNext) {
+                        const s0 = addPin(i, r + 1, ranges[i][r + 1]);
+                        const s1 = addPin(j, r + 1, ranges[j][r + 1]);
+                        addQuad(wt0, s0, s1, wt1);
+                    }
+                }
+            }
         }
 
-        for (let i = 0; i < numAzimuths - 1; i++) {
-            const b0 = 1 + i * 2;
-            const t0 = 2 + i * 2;
-            const b1 = 1 + (i + 1) * 2;
-            const t1 = 2 + (i + 1) * 2;
-
-            indices.push(b0, t0, t1);
-            indices.push(b0, t1, b1);
-            indices.push(apexIdx, t1, t0);
-            indices.push(apexIdx, b0, b1);
+        // End walls for a partial sector (e.g. 90° to 135°)
+        if (!closeLoop) {
+            for (const i of [0, nAz - 1]) {
+                let prev = addPin(i, 0, ranges[i][0]);
+                for (let r = 0; r < nRings; r++) {
+                    const up = addPin(i, r + 1, ranges[i][r]);
+                    indices.push(apex, prev, up);
+                    prev = up;
+                    if (r < nRings - 1 && ranges[i][r + 1] !== ranges[i][r]) {
+                        // Step pin lies on the same line from the radar, so no triangle needed
+                        prev = addPin(i, r + 1, ranges[i][r + 1]);
+                    }
+                }
+            }
         }
 
         const geometry = new Cesium.Geometry({
@@ -465,29 +523,26 @@ export class CesiumRadarCoverage {
                 })
             } as unknown) as Cesium.GeometryAttributes,
             indices: new Uint32Array(indices),
-            boundingSphere: Cesium.BoundingSphere.fromPoints(
-                positions.reduce((acc: Cesium.Cartesian3[], _, idx, arr) => {
-                    if (idx % 3 === 0) {
-                        acc.push(new Cesium.Cartesian3(arr[idx], arr[idx+1], arr[idx+2]));
-                    }
-                    return acc;
-                }, [])
-            )
+            primitiveType: Cesium.PrimitiveType.TRIANGLES,
+            boundingSphere: Cesium.BoundingSphere.fromVertices(positions)
         });
 
-        Cesium.GeometryPipeline.computeNormal(geometry);
-
+        // flat: true -> same colour everywhere, no lighting bands, no normals needed
+        // closed: false -> draw both sides (the shell is open at the radar)
         const primitive = new Cesium.Primitive({
             geometryInstances: new Cesium.GeometryInstance({
-                geometry: geometry,
+                geometry,
                 id: entityId,
                 attributes: {
-                    color: Cesium.ColorGeometryInstanceAttribute.fromColor(zone.color.withAlpha(zone.beamOpacity))
+                    color: Cesium.ColorGeometryInstanceAttribute.fromColor(
+                        zone.color.withAlpha(zone.beamOpacity)
+                    )
                 }
             }),
             appearance: new Cesium.PerInstanceColorAppearance({
                 translucent: true,
-                closed: true
+                closed: false,
+                flat: true
             }),
             asynchronous: false
         });
