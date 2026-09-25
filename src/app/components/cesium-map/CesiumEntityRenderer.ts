@@ -13,21 +13,14 @@ export class CesiumEntityRenderer {
     // Live radar coverage handles, keyed by source entity.id
     private readonly radarEntities = new Map<string, RadarCoverageHandle[]>();
 
-    // Signature of the exact inputs (position + radar properties) that the
-    // currently-built coverage for an entity was generated from. If a
-    // render() call comes in and nothing in this signature changed, we skip
-    // rebuilding entirely - this is what stops the ray fan from swimming
-    // on every camera pan/zoom/selection change.
+    // Signature of the inputs the current coverage was built from.
+    // If nothing in it changed, we skip rebuilding.
     private readonly lastBuiltSignature = new Map<string, string>();
 
     // Guards against overlapping async rebuilds for the same entity
     private readonly buildInFlight = new Set<string>();
 
-    // Latest entity state that arrived while a build was already running. A
-    // rebuild takes long enough (terrain sampling per ray) that a drag can
-    // easily finish mid-build, so the newest state is parked here and built as
-    // soon as the running build finishes - otherwise the drop position would
-    // never be rendered at all.
+    // Newest entity state that arrived while a build was running
     private readonly pendingRebuild = new Map<string, Entity>();
 
     constructor(
@@ -42,7 +35,6 @@ export class CesiumEntityRenderer {
         const seenIds = new Set<string>();
 
         for (const entity of entities) {
-
             if (
                 (filter === TeamFilter.Blue && entity.team !== Team.Blue) ||
                 (filter === TeamFilter.Red && entity.team !== Team.Red)
@@ -56,7 +48,6 @@ export class CesiumEntityRenderer {
             }
         }
 
-        // Clean up coverage for radars that no longer exist / no longer pass the filter
         for (const existingId of Array.from(this.radarEntities.keys())) {
             if (!seenIds.has(existingId)) {
                 this.removeRadarCoverage(existingId);
@@ -83,33 +74,37 @@ export class CesiumEntityRenderer {
         this.pendingRebuild.delete(entityId);
     }
 
-    private buildSignature(entity: Entity): string {
+    // ONE place for all radar settings + their defaults.
+    // Used both for the signature and for the actual build, so they can never disagree.
+    private readRadarSettings(entity: Entity) {
         const props = (entity.definition.properties as any) ?? {};
+        return {
+            mastHeight: props.antennaMastHeight ?? 2,
+            sectorStartDeg: props.sectorStartDeg ?? 0,
+            sectorSweepDeg: props.sectorSweepDeg ?? 360,
+            azimuthStepDeg: props.azimuthStepDeg ?? 2,
+            rangeSampleSteps: props.rangeSampleSteps,
+            clearanceToleranceM: props.clearanceToleranceM ?? 1,
 
+            drawFootprint: props.drawFootprint ?? true,
+            footprintOpacity: props.footprintOpacity ?? 0.25,
+
+            drawVolume: props.drawVolume ?? true,
+            beamOpacity: props.beamOpacity ?? 0.18,
+            volumeCellSizeM: props.volumeCellSizeM ?? 50,
+
+            zoneVisibility: props.zoneVisibility ?? {},
+            zoneRanges: props.zoneRanges ?? {},
+            zoneElevations: props.zoneElevations ?? {}
+        };
+    }
+
+    private buildSignature(entity: Entity): string {
         return JSON.stringify({
             lon: entity.position.longitude,
             lat: entity.position.latitude,
             alt: entity.position.altitude,
-
-            sectorStartDeg: props.sectorStartDeg ?? 0,
-            sectorSweepDeg: props.sectorSweepDeg ?? 360,
-            antennaMastHeight: props.antennaMastHeight ?? 0,
-
-            drawRays: props.drawRays ?? false,
-
-            beamOpacity: props.beamOpacity ?? 0.28,
-            interiorOpacity: props.interiorOpacity ?? 0.08,
-            showInterior: props.showInterior ?? true,
-            
-
-            zoneVisibility: props.zoneVisibility ?? {},
-            zoneRanges: props.zoneRanges ?? {},
-            zoneElevations: props.zoneElevations ?? {},
-
-            azimuthStepDeg: props.azimuthStepDeg,
-            elevationRingsPerZone: props.elevationRingsPerZone,
-            rangeSampleSteps: props.rangeSampleSteps,
-            useObjectPicking: props.useObjectPicking ?? false
+            ...this.readRadarSettings(entity)
         });
     }
 
@@ -118,13 +113,10 @@ export class CesiumEntityRenderer {
         const signature = this.buildSignature(entity);
 
         if (this.lastBuiltSignature.get(entity.id) === signature) {
-            // Nothing relevant changed - keep existing entities as-is.
             return;
         }
 
         if (this.buildInFlight.has(entity.id)) {
-            // Park the newest state; the running build rebuilds from it when
-            // it finishes. Older parked states are simply overwritten.
             this.pendingRebuild.set(entity.id, entity);
             return;
         }
@@ -132,16 +124,15 @@ export class CesiumEntityRenderer {
         this.buildInFlight.add(entity.id);
 
         try {
-
-            const props = (entity.definition.properties as any) ?? {};
+            const s = this.readRadarSettings(entity);
 
             const zoneOverrides: Record<string, RadarZoneOverride> = {};
             for (const zone of CesiumRadarCoverage.DEFAULT_3D_ZONES) {
                 zoneOverrides[zone.name] = {
-                    visible: props.zoneVisibility?.[zone.name] ?? true,
-                    range: props.zoneRanges?.[zone.name],
-                    minElevationDeg: props.zoneElevations?.[zone.name]?.min,
-                    maxElevationDeg: props.zoneElevations?.[zone.name]?.max
+                    visible: s.zoneVisibility?.[zone.name] ?? true,
+                    range: s.zoneRanges?.[zone.name],
+                    minElevationDeg: s.zoneElevations?.[zone.name]?.min,
+                    maxElevationDeg: s.zoneElevations?.[zone.name]?.max
                 };
             }
 
@@ -153,28 +144,20 @@ export class CesiumEntityRenderer {
                     longitude: entity.position.longitude,
                     latitude: entity.position.latitude,
                     altitude: entity.position.altitude,
-                    mastHeight: props.antennaMastHeight ?? 0,
-                    sectorStartDeg: props.sectorStartDeg ?? 0,
-                    sectorSweepDeg: props.sectorSweepDeg ?? 360,
-                    drawRays: props.drawRays ?? false,
-                    // Multi-ring precision sampling. Raise these per-radar via
-                    // entity properties for finer detail (cost scales as
-                    // azimuths x rings x steps). rangeSampleSteps is left unset
-                    // on purpose: the coverage builder then derives it from each
-                    // zone's range so every zone samples at the same ground
-                    // resolution instead of coarsening as range grows.
-                    azimuthStepDeg: props.azimuthStepDeg ?? 2,
-                    elevationRingsPerZone: props.elevationRingsPerZone ?? 10,
-                    rangeSampleSteps: props.rangeSampleSteps,
-                    // On by default so placed GLB objects block rays. Each ray
-                    // rejects a model on its bounding sphere first, so scenes
-                    // with no objects near the beam cost almost nothing.
-                    useObjectPicking: props.useObjectPicking ?? true,
 
-                    beamOpacity: props.beamOpacity ?? 0.28,
-                    interiorOpacity: props.interiorOpacity ?? 0.08,
-                    showInterior: props.showInterior ?? true,
-                    
+                    mastHeight: s.mastHeight,
+                    sectorStartDeg: s.sectorStartDeg,
+                    sectorSweepDeg: s.sectorSweepDeg,
+                    azimuthStepDeg: s.azimuthStepDeg,
+                    rangeSampleSteps: s.rangeSampleSteps,
+                    clearanceToleranceM: s.clearanceToleranceM,
+
+                    drawFootprint: s.drawFootprint,
+                    footprintOpacity: s.footprintOpacity,
+
+                    drawVolume: s.drawVolume,
+                    beamOpacity: s.beamOpacity,
+                    volumeCellSizeM: s.volumeCellSizeM,
 
                     zoneOverrides
                 }
@@ -199,7 +182,6 @@ export class CesiumEntityRenderer {
             this.buildInFlight.delete(entity.id);
 
             const pending = this.pendingRebuild.get(entity.id);
-
             if (pending) {
                 this.pendingRebuild.delete(entity.id);
                 this.syncRadarCoverage(pending);
