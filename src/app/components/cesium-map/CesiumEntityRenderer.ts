@@ -5,7 +5,7 @@ import { EditorState } from "../../core/state/EditorState";
 import { TeamFilterService } from "../../core/services/TeamFilterService";
 import { Team } from "../../core/types/Team";
 import { TeamFilter } from "../../core/models/TeamFilter";
-import { CesiumRadarCoverage, RadarCoverageHandle, RadarZoneOverride } from "./CesiumRadarCoverage";
+import { CesiumRadarCoverage, RadarCoverageHandle, RadarStyle, RadarZoneOverride } from "./CesiumRadarCoverage";
 
 
 export class CesiumEntityRenderer {
@@ -29,6 +29,15 @@ export class CesiumEntityRenderer {
     // soon as the running build finishes - otherwise the drop position would
     // never be rendered at all.
     private readonly pendingRebuild = new Map<string, Entity>();
+
+    // Look-only settings (opacities, ring toggle) last applied to the live
+    // coverage. These never trigger a rebuild - they are pushed into the
+    // existing handles through setStyle.
+    private readonly lastAppliedStyle = new Map<string, string>();
+
+    // Newest entity state seen per radar, so a build that finishes can apply
+    // style changes that arrived while it was running.
+    private readonly latestEntity = new Map<string, Entity>();
 
     constructor(
         private viewer: Cesium.Viewer,
@@ -81,6 +90,28 @@ export class CesiumEntityRenderer {
         this.radarEntities.delete(entityId);
         this.lastBuiltSignature.delete(entityId);
         this.pendingRebuild.delete(entityId);
+        this.lastAppliedStyle.delete(entityId);
+        this.latestEntity.delete(entityId);
+    }
+
+    private styleOf(entity: Entity): RadarStyle {
+        const props = (entity.definition.properties as any) ?? {};
+        return {
+            beamOpacity: props.beamOpacity ?? 0.28,
+            interiorOpacity: props.interiorOpacity ?? 0.08,
+            showInterior: props.showInterior ?? true
+        };
+    }
+
+    private applyStyle(entity: Entity): void {
+        const style = this.styleOf(entity);
+        const key = JSON.stringify(style);
+        if (this.lastAppliedStyle.get(entity.id) === key) return;
+
+        for (const handle of this.radarEntities.get(entity.id) ?? []) {
+            handle.setStyle?.(style);
+        }
+        this.lastAppliedStyle.set(entity.id, key);
     }
 
     private buildSignature(entity: Entity): string {
@@ -97,9 +128,8 @@ export class CesiumEntityRenderer {
 
             drawRays: props.drawRays ?? false,
 
-            beamOpacity: props.beamOpacity ?? 0.28,
-            interiorOpacity: props.interiorOpacity ?? 0.08,
-            showInterior: props.showInterior ?? true,
+            // beamOpacity / interiorOpacity / showInterior are deliberately not
+            // here: they are applied in place by applyStyle.
             showBlockedPoints: props.showBlockedPoints ?? false,
 
             zoneVisibility: props.zoneVisibility ?? {},
@@ -116,9 +146,11 @@ export class CesiumEntityRenderer {
     private async syncRadarCoverage(entity: Entity): Promise<void> {
 
         const signature = this.buildSignature(entity);
+        this.latestEntity.set(entity.id, entity);
 
         if (this.lastBuiltSignature.get(entity.id) === signature) {
-            // Nothing relevant changed - keep existing entities as-is.
+            // Geometry unchanged - at most the look changed, which is cheap.
+            this.applyStyle(entity);
             return;
         }
 
@@ -190,6 +222,11 @@ export class CesiumEntityRenderer {
 
             this.radarEntities.set(entity.id, newHandles);
             this.lastBuiltSignature.set(entity.id, signature);
+
+            // The new build used the style from when it started; bring it up to
+            // date with any slider moves made while it was running.
+            this.lastAppliedStyle.delete(entity.id);
+            this.applyStyle(this.latestEntity.get(entity.id) ?? entity);
 
             this.viewer.scene.requestRender();
 

@@ -29,7 +29,10 @@ export class CesiumSelection {
         }
 
         // If a 3D radar wall, cap, or ray was clicked, select its parent radar entity
-        const targetId = pickedEntity.radarParentId || pickedEntity.id;
+        // Radar beam primitives carry the radar's id directly as a string
+        const targetId = typeof pickedEntity === "string"
+            ? pickedEntity
+            : pickedEntity.radarParentId || pickedEntity.id;
 
         const entity = this.entityRepository
             .all()
