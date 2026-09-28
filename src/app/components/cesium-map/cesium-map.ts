@@ -528,6 +528,10 @@ onInteriorToggle(checked: boolean): void {
   });
 }
 
+  onShowBlockedPointsChange(checked: boolean): void {
+    this.updateRadarProperty({ showBlockedPoints: checked });
+  }
+
   toggleDrawRays(): void {
     this.onDrawRaysChange(!this.getRadarProp('drawRays', false));
   }

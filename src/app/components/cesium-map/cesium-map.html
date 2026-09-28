@@ -84,6 +84,13 @@
           <span>Draw 3D Rays</span>
         </label>
 
+        <label class="checkbox-field">
+          <input type="checkbox"
+            [checked]="getRadarProp('showBlockedPoints', false)"
+            (change)="onShowBlockedPointsChange($any($event.target).checked)">
+          <span>Show Terrain Blocking Points</span>
+        </label>
+
         <div class="beam-control">
 
   <div class="beam-control__header">

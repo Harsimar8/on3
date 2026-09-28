@@ -100,7 +100,7 @@ export class CesiumEntityRenderer {
             beamOpacity: props.beamOpacity ?? 0.28,
             interiorOpacity: props.interiorOpacity ?? 0.08,
             showInterior: props.showInterior ?? true,
-            
+            showBlockedPoints: props.showBlockedPoints ?? false,
 
             zoneVisibility: props.zoneVisibility ?? {},
             zoneRanges: props.zoneRanges ?? {},
@@ -174,7 +174,7 @@ export class CesiumEntityRenderer {
                     beamOpacity: props.beamOpacity ?? 0.28,
                     interiorOpacity: props.interiorOpacity ?? 0.08,
                     showInterior: props.showInterior ?? true,
-                    
+                    showBlockedPoints: props.showBlockedPoints ?? false,
 
                     zoneOverrides
                 }
