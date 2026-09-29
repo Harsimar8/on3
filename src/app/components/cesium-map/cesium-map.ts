@@ -522,6 +522,18 @@ onInteriorOpacityChange(value: string): void {
   });
 }
 
+onCylinderOpacityChange(value: string): void {
+  this.updateRadarProperty({
+    cylinderOpacity: Math.max(0, Math.min(1, +value))
+  });
+}
+
+onCylinderToggle(checked: boolean): void {
+  this.updateRadarProperty({
+    showCylinders: checked
+  });
+}
+
 onInteriorToggle(checked: boolean): void {
   this.updateRadarProperty({
     showInterior: checked

@@ -22,6 +22,8 @@ export interface RadarOptions {
     beamOpacity?: number;
     interiorOpacity?: number;
     showInterior?: boolean;
+    cylinderOpacity?: number;
+    showCylinders?: boolean;
     interiorLayers?: number;
     showBlockedPoints?: boolean;
 }
@@ -88,6 +90,8 @@ export interface RadarStyle {
     beamOpacity: number;
     interiorOpacity: number;
     showInterior: boolean;
+    cylinderOpacity: number;
+    showCylinders: boolean;
 }
 
 export interface RadarCoverageHandle {
@@ -270,7 +274,9 @@ export class CesiumRadarCoverage {
         const style: RadarStyle = {
             beamOpacity: options.beamOpacity ?? 0.35,
             interiorOpacity,
-            showInterior
+            showInterior,
+            cylinderOpacity: options.cylinderOpacity ?? 0.15,
+            showCylinders: options.showCylinders ?? true
         };
         let litColor = Cesium.Color.WHITE.withAlpha(style.beamOpacity);
         const ringOpacityOf = (st: RadarStyle) => Cesium.Math.clamp(st.interiorOpacity / INTERIOR_SLIDER_MAX, 0, 1);
@@ -311,15 +317,61 @@ export class CesiumRadarCoverage {
             return ring;
         });
 
+        // Coverage wall of every zone: one plain surface around the zone's range
+        // (closed back to the radar for a sector), from the radar's ground up to
+        // the height the zone's top-angle beam reaches at that range. Drawn flat
+        // (unlit, no outline) so it is one even shade all round. Faded by
+        // "Zone Cylinders".
+        const cylinders = zones.map((zone, z) => {
+            const top = radarHeight + zone.range * Math.tan(Cesium.Math.toRadians(zone.maxElevationDeg));
+            const positions = CesiumRadarCoverage.buildRangeRing(enuMatrix, radarPosition, zone);
+            const primitive = viewer.scene.primitives.add(new Cesium.Primitive({
+                geometryInstances: new Cesium.GeometryInstance({
+                    id: `radar-wall-${entityId}-${z}`,
+                    geometry: new Cesium.WallGeometry({
+                        positions,
+                        minimumHeights: positions.map(() => terrainHeight),
+                        maximumHeights: positions.map(() => Math.max(top, terrainHeight + 1))
+                    }),
+                    attributes: {
+                        color: Cesium.ColorGeometryInstanceAttribute.fromColor(zone.color.withAlpha(style.cylinderOpacity))
+                    }
+                }),
+                appearance: new Cesium.PerInstanceColorAppearance({ flat: true, translucent: true }),
+                asynchronous: false
+            })) as Cesium.Primitive;
+            primitive.show = style.showCylinders && style.cylinderOpacity > 0;
+            return primitive;
+        });
+        const setCylinderStyle = (st: RadarStyle) => {
+            cylinders.forEach((primitive, z) => {
+                primitive.show = st.showCylinders && st.cylinderOpacity > 0;
+                const color = Cesium.ColorGeometryInstanceAttribute.toValue(zones[z].color.withAlpha(st.cylinderOpacity));
+                try {
+                    primitive.getGeometryInstanceAttributes(`radar-wall-${entityId}-${z}`).color = color;
+                } catch {
+                    // Not drawn yet: apply the colour after the next frame.
+                    const remove = viewer.scene.postRender.addEventListener(() => {
+                        remove();
+                        if (primitive.isDestroyed()) return;
+                        primitive.getGeometryInstanceAttributes(`radar-wall-${entityId}-${z}`).color = color;
+                        viewer.scene.requestRender();
+                    });
+                }
+            });
+        };
+
         handles.push({
             dispose: () => {
                 for (const ring of rings) viewer.entities.remove(ring);
+                for (const cylinder of cylinders) viewer.scene.primitives.remove(cylinder);
             },
             setStyle: (st: RadarStyle) => {
                 litColor = Cesium.Color.WHITE.withAlpha(st.beamOpacity);
                 const ringOpacity = ringOpacityOf(st);
                 ringColors = zones.map(zone => zone.color.withAlpha(ringOpacity));
                 for (const ring of rings) ring.show = st.showInterior && ringOpacity > 0;
+                setCylinderStyle(st);
                 viewer.scene.requestRender();
             }
         });

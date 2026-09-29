@@ -153,6 +153,43 @@
   >
   <span>Show Interior Beam</span>
 </label>
+
+
+<div class="beam-control">
+
+  <div class="beam-control__header">
+    <span>Zone Cylinders</span>
+    <strong>
+      {{ getRadarProp('cylinderOpacity', 0.15) * 100 | number:'1.0-0' }}%
+    </strong>
+  </div>
+
+  <input
+    class="beam-slider"
+    type="range"
+    min="0"
+    max="1"
+    step="0.01"
+    [value]="getRadarProp('cylinderOpacity', 0.15)"
+    (input)="onCylinderOpacityChange($any($event.target).value)"
+  >
+
+  <div class="beam-control__range">
+    <span>Transparent</span>
+    <span>Solid</span>
+  </div>
+
+</div>
+
+
+<label class="checkbox-field">
+  <input
+    type="checkbox"
+    [checked]="getRadarProp('showCylinders', true)"
+    (change)="onCylinderToggle($any($event.target).checked)"
+  >
+  <span>Show Zone Cylinders</span>
+</label>
       </section>
 
       <section class="radar-section">

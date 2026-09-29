@@ -99,7 +99,9 @@ export class CesiumEntityRenderer {
         return {
             beamOpacity: props.beamOpacity ?? 0.28,
             interiorOpacity: props.interiorOpacity ?? 0.08,
-            showInterior: props.showInterior ?? true
+            showInterior: props.showInterior ?? true,
+            cylinderOpacity: props.cylinderOpacity ?? 0.15,
+            showCylinders: props.showCylinders ?? true
         };
     }
 
@@ -128,7 +130,7 @@ export class CesiumEntityRenderer {
 
             drawRays: props.drawRays ?? false,
 
-            // beamOpacity / interiorOpacity / showInterior are deliberately not
+            // beamOpacity / interiorOpacity / showInterior / cylinder style are deliberately not
             // here: they are applied in place by applyStyle.
             showBlockedPoints: props.showBlockedPoints ?? false,
 
@@ -206,6 +208,8 @@ export class CesiumEntityRenderer {
                     beamOpacity: props.beamOpacity ?? 0.28,
                     interiorOpacity: props.interiorOpacity ?? 0.08,
                     showInterior: props.showInterior ?? true,
+                    cylinderOpacity: props.cylinderOpacity ?? 0.15,
+                    showCylinders: props.showCylinders ?? true,
                     showBlockedPoints: props.showBlockedPoints ?? false,
 
                     zoneOverrides
