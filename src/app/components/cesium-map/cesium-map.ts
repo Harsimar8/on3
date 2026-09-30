@@ -558,8 +558,13 @@ onInteriorToggle(checked: boolean): void {
   });
 }
 
+  onTargetHeightChange(value: string): void {
+    this.updateRadarProperty({ targetHeightAgl: Math.max(0, +value) });
+  }
+
   onShadowOpacityChange(value: string): void {
-    this.updateRadarProperty({ shadowOpacity: Math.max(0, Math.min(1, +value)) });
+    // Moving the slider means the user wants to see the dark layer.
+    this.updateRadarProperty({ shadowOpacity: Math.max(0, Math.min(1, +value)), showShadow: true });
   }
 
   onShadowToggle(checked: boolean): void {
@@ -606,7 +611,6 @@ onInteriorToggle(checked: boolean): void {
 
   closeRadarPanel(): void {
     this.radarPanelClosed.set(true);
-    this.clearLosProbe();
   }
 
   /** Rebuilds every radar's coverage, e.g. after an obstacle moved or resized. */
@@ -726,11 +730,13 @@ onInteriorToggle(checked: boolean): void {
     }
   }
 
-  /** The probe works on the selected radar while its panel is open. */
+  /**
+   * Once switched on in the panel, the probe keeps working after the panel is
+   * closed (selected radar first, else the nearest radar that reaches the spot).
+   * The radar symbol itself still selects the radar and opens its panel.
+   */
   private losProbeActive(): boolean {
-    return this.losProbeEnabled() &&
-      !this.radarPanelClosed() &&
-      this.editorState.selectedEntity()?.definition.entityType === 'RadarSite';
+    return this.losProbeEnabled();
   }
 
   /**

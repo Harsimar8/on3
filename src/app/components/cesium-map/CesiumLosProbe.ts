@@ -17,8 +17,11 @@ export type LosProbeStatus = "visible" | "blocked" | "above" | "outOfRange" | "o
 
 export interface LosProbeResult {
     status: LosProbeStatus;
+    // Short text for the label on the map.
     title: string;
     details: string[];
+    // Full explanation for the radar panel.
+    explanation: string[];
 }
 
 // Finest spacing between terrain samples along the probe line; longer lines
@@ -32,6 +35,9 @@ const COLOR_CLEAR = Cesium.Color.fromCssColorString("#22c55e");
 const COLOR_BLOCKED = Cesium.Color.fromCssColorString("#ef4444");
 const COLOR_GRAZING = Cesium.Color.fromCssColorString("#f59e0b");
 const COLOR_MUTED = Cesium.Color.fromCssColorString("#94a3b8");
+
+// A position worked out when drawn (see CesiumLosProbe.onGround).
+type Point = (result?: Cesium.Cartesian3) => Cesium.Cartesian3;
 
 export class CesiumLosProbe {
 
@@ -81,18 +87,26 @@ export class CesiumLosProbe {
         const maxRange = Math.max(...geometry.zones.map(z => z.range));
 
         if (inSector.length === 0) {
-            return this.finish(token, geometry, target, target.height, {
+            return this.finish(token, target, target.height, {
                 status: "outOfSector",
-                title: "NOT COVERED - radar does not point this way",
-                details: ["This spot is outside the radar's sector"]
+                title: "OUTSIDE SECTOR",
+                details: ["Radar does not point this way"],
+                explanation: [
+                    `This spot is at bearing ${azimuthDeg.toFixed(1)}° from the radar.`,
+                    "No zone's sector points in that direction, so the radar never looks here."
+                ]
             });
         }
         const inRange = inSector.filter(z => dist <= z.range);
         if (inRange.length === 0) {
-            return this.finish(token, geometry, target, target.height, {
+            return this.finish(token, target, target.height, {
                 status: "outOfRange",
-                title: "NOT COVERED - too far from the radar",
-                details: [`This spot is ${km(dist)} away, the radar reaches only ${km(maxRange)}`]
+                title: "OUT OF RANGE",
+                details: [`${km(dist)} away, radar reaches ${km(maxRange)}`],
+                explanation: [
+                    `This spot is ${km(dist)} from the radar.`,
+                    `The furthest zone only reaches ${km(maxRange)}, so the radar does not cover it at any height.`
+                ]
             });
         }
 
@@ -111,7 +125,9 @@ export class CesiumLosProbe {
 
         const heights = sampled.map(p => p.height ?? 0);
         const last = count - 1;
-        const targetHeight = heights[last];
+        // The aircraft the coverage is worked out for, flying above the spot.
+        const agl = geometry.targetHeightAgl;
+        const targetHeight = heights[last] + agl;
         const targetAngle = CesiumRadarCoverage.elevationAngle(targetHeight, dist, geometry.radarHeight);
 
         // The terrain the beam has to clear before reaching the point (same
@@ -130,65 +146,71 @@ export class CesiumLosProbe {
         // Lowest beam that gets over that terrain.
         const ridgeAngle = Math.atan(horizon);
 
-        const spotLine = (zone: ResolvedZone) => `This spot: ${km(dist)} from the radar, in ${zone.name}`;
         const targetDeg = Cesium.Math.toDegrees(targetAngle);
-
-        // One line per configured zone saying why it does or does not light the
-        // spot, so a zone that is off, too short or too low is never a mystery.
-        const zoneLines = () => CesiumRadarCoverage.DEFAULT_3D_ZONES.map(config => {
-            const zone = geometry.zones.find(z => z.name === config.name);
-            if (!zone) return `${config.name}: turned off`;
-            if (!CesiumLosProbe.inSector(zone, azimuthDeg)) return `${zone.name}: not pointing this way`;
-            if (dist > zone.range) return `${zone.name}: reaches only ${km(zone.range)}`;
-            if (targetDeg > zone.maxElevationDeg) return `${zone.name}: beam only goes up to ${zone.maxElevationDeg}°`;
-            return `${zone.name}: covers it`;
-        });
+        const where = (zone: ResolvedZone) => `${km(dist)} away · ${zone.name}`;
 
         if (ridge > 0 && Math.tan(targetAngle) < horizon) {
-            const hiddenBy = CesiumRadarCoverage.beamHeightAt(ridgeAngle, dist, geometry.radarHeight) - targetHeight;
+            // Height above this spot's ground of the lowest beam that clears the hill.
+            const lowestSeen = CesiumRadarCoverage.beamHeightAt(ridgeAngle, dist, geometry.radarHeight) - heights[last];
             const behind = dist - dists[ridge];
-            const higherBy = targetHeight - heights[ridge];
-            this.drawBlocked(geometry, azimuthDeg, dists[ridge], heights[ridge], ridgeAngle, dist, targetHeight);
-            return this.finish(token, geometry, points[last], targetHeight, {
+            const higherBy = heights[last] - heights[ridge];
+            this.drawBlocked(geometry, azimuthDeg, dists[ridge], heights[ridge], ridgeAngle, dist, heights[last], agl);
+            return this.finish(token, points[last], heights[last], {
                 status: "blocked",
-                title: "NOT VISIBLE - higher ground is in the way",
-                details: [
-                    `Hill/ridge ${km(dists[ridge])} from the radar hides this spot`,
-                    `(hill top ${Math.round(heights[ridge])} m, radar antenna at ${Math.round(geometry.radarHeight)} m)`,
+                title: `HIDDEN - higher ground ${km(dists[ridge])} away`,
+                details: [`Seen here only above ${km(lowestSeen)}`],
+                explanation: [
+                    `Ground ${km(dists[ridge])} from the radar is in the way: it rises to ` +
+                    `${Math.round(heights[ridge])} m, ${Math.round(heights[ridge] - geometry.radarHeight)} m ` +
+                    `${heights[ridge] >= geometry.radarHeight ? "above" : "below"} the radar antenna (${Math.round(geometry.radarHeight)} m).`,
+                    ...(geometry.radarHeight - heights[0] < 1
+                        ? ["The antenna is at ground level (Mast Height 0), so even small rises near it hide what is behind them."]
+                        : []),
                     // The spot can be higher than the hill top and still hidden:
                     // the beam climbs to get over the hill and keeps climbing.
-                    higherBy > 0
-                        ? `This spot is ${Math.round(higherBy)} m higher than the hill top, but ${km(behind)} behind it.`
-                        : `This spot is ${Math.round(-higherBy)} m lower than the hill top, ${km(behind)} behind it.`,
-                    `To clear the hill the beam climbs at ${Cesium.Math.toDegrees(ridgeAngle).toFixed(1)}°,`,
-                    `so it passes ${km(hiddenBy)} above this spot.`,
-                    `Anything flying more than ${km(hiddenBy)} above here would be seen.`,
-                    spotLine(inRange[0])
+                    `The ground here is ${Math.round(Math.abs(higherBy))} m ${higherBy > 0 ? "higher" : "lower"} ` +
+                    `than that point and ${km(behind)} behind it.`,
+                    `To get over it the beam must climb at least ${Cesium.Math.toDegrees(ridgeAngle).toFixed(1)}°, ` +
+                    `so above this spot it only comes down to ${km(lowestSeen)} above the ground.`,
+                    `An aircraft ${agl} m above the ground here is ${km(lowestSeen - agl)} too low to be seen. ` +
+                    `Anything flying higher than ${km(lowestSeen)} would be detected.`,
+                    `${km(dist)} from the radar, inside ${inRange[0].name}'s range.`
                 ]
             }, false);
         }
 
         const litBy = inRange.find(z => targetDeg <= z.maxElevationDeg);
         if (!litBy) {
-            this.drawRay(geometry.radarPosition, points[last], targetHeight, COLOR_GRAZING);
-            return this.finish(token, geometry, points[last], targetHeight, {
+            this.drawRay(geometry, points[last], heights[last], agl, COLOR_GRAZING);
+            return this.finish(token, points[last], heights[last], {
                 status: "above",
-                title: "NOT COVERED - spot is too high for the beam",
-                details: [
-                    `Nothing blocks it, but the spot is ${targetDeg.toFixed(1)}° up from the radar`,
-                    `(${km(dist)} away). Zone by zone:`,
-                    ...zoneLines()
+                title: "TOO HIGH FOR THE BEAM",
+                details: [`${targetDeg.toFixed(1)}° up, beam reaches ${Math.max(...inRange.map(z => z.maxElevationDeg))}°`],
+                explanation: [
+                    `No terrain blocks the line from the radar to an aircraft ${agl} m above this spot.`,
+                    `But that aircraft is ${targetDeg.toFixed(1)}° up from the antenna (${km(dist)} away), ` +
+                    `steeper than the beam goes. Zone by zone:`,
+                    ...CesiumRadarCoverage.DEFAULT_3D_ZONES.map(config => {
+                        const zone = geometry.zones.find(z => z.name === config.name);
+                        if (!zone) return `${config.name}: turned off`;
+                        if (!CesiumLosProbe.inSector(zone, azimuthDeg)) return `${zone.name}: not pointing this way`;
+                        if (dist > zone.range) return `${zone.name}: reaches only ${km(zone.range)}`;
+                        return `${zone.name}: beam only goes up to ${zone.maxElevationDeg}°`;
+                    })
                 ]
             }, false);
         }
 
-        this.drawRay(geometry.radarPosition, points[last], targetHeight, COLOR_CLEAR);
-        return this.finish(token, geometry, points[last], targetHeight, {
+        this.drawRay(geometry, points[last], heights[last], agl, COLOR_CLEAR);
+        return this.finish(token, points[last], heights[last], {
             status: "visible",
-            title: "VISIBLE - the radar can see this spot",
-            details: [
-                "Nothing is in the way",
-                spotLine(litBy)
+            title: "VISIBLE",
+            details: [where(litBy)],
+            explanation: [
+                `Nothing blocks the line from the radar to an aircraft ${agl} m above this spot.`,
+                `It is ${targetDeg.toFixed(1)}° up from the antenna, inside ${litBy.name}'s beam ` +
+                `(up to ${litBy.maxElevationDeg}°, ${km(litBy.range)} range).`,
+                `${km(dist)} from the radar.`
             ]
         }, false);
     }
@@ -204,13 +226,34 @@ export class CesiumLosProbe {
     // Drawing
     // -------------------------------------------------------------------
 
+    // Every point drawn on the terrain is re-read from the terrain Cesium is
+    // showing right now (globe.getHeight), so at any zoom level the dots, the
+    // hill marker and the line ends sit on the visible ground instead of
+    // floating above it or sinking into it as coarser / finer tiles load.
+    // The maths and the text always use the detailed sampled heights.
+    private onGround(at: Cesium.Cartographic, sampledHeight: number, above = 0): Point {
+        const globe = this.viewer.scene.globe;
+        const c = new Cesium.Cartographic(at.longitude, at.latitude);
+        return (result?: Cesium.Cartesian3) => {
+            const shown = globe.getHeight(c);
+            return Cesium.Cartesian3.fromRadians(c.longitude, c.latitude, (shown ?? sampledHeight) + above, undefined, result);
+        };
+    }
+
+    private fixed(position: Cesium.Cartesian3): Point {
+        return (result?: Cesium.Cartesian3) => Cesium.Cartesian3.clone(position, result);
+    }
+
+    private positionOf(point: Point): Cesium.PositionProperty {
+        return new Cesium.CallbackPositionProperty((_time, result) => point(result), false);
+    }
+
     // Clears the previous probe (unless the caller already drew this one's
-    // lines) and puts the result label on the clicked point.
+    // lines) and puts the result label on the clicked spot, on the ground.
     private finish(
         token: number,
-        geometry: RadarGeometry,
         target: Cesium.Cartographic,
-        targetHeight: number,
+        groundHeight: number,
         result: LosProbeResult,
         clearFirst = true
     ): LosProbeResult | null {
@@ -226,13 +269,12 @@ export class CesiumLosProbe {
         }[result.status];
 
         this.add({
-            position: Cesium.Cartesian3.fromRadians(target.longitude, target.latitude, targetHeight + GROUND_LIFT_M),
+            position: this.positionOf(this.onGround(target, groundHeight, GROUND_LIFT_M)),
             point: {
                 pixelSize: 10,
                 color,
                 outlineColor: Cesium.Color.WHITE,
                 outlineWidth: 2,
-                heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
                 disableDepthTestDistance: Number.POSITIVE_INFINITY
             },
             label: {
@@ -246,12 +288,28 @@ export class CesiumLosProbe {
                 horizontalOrigin: Cesium.HorizontalOrigin.RIGHT,
                 verticalOrigin: Cesium.VerticalOrigin.TOP,
                 pixelOffset: new Cesium.Cartesian2(-14, 6),
-                heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
                 disableDepthTestDistance: Number.POSITIVE_INFINITY
             }
         });
         this.viewer.scene.requestRender();
         return result;
+    }
+
+    // The aircraft being checked: a small white dot `agl` metres above the
+    // spot, joined to the ground by a thin vertical line.
+    private drawAircraft(ground: Point, aircraft: Point, agl: number): void {
+        if (agl <= 0) return;
+        this.addLine([ground, aircraft], Cesium.Color.WHITE, true, 2);
+        this.add({
+            position: this.positionOf(aircraft),
+            point: {
+                pixelSize: 7,
+                color: Cesium.Color.WHITE,
+                outlineColor: Cesium.Color.BLACK,
+                outlineWidth: 1,
+                disableDepthTestDistance: Number.POSITIVE_INFINITY
+            }
+        });
     }
 
     private drawBlocked(
@@ -261,73 +319,80 @@ export class CesiumLosProbe {
         ridgeHeight: number,
         ridgeAngle: number,
         targetDist: number,
-        targetHeight: number
+        groundHeight: number,
+        agl: number
     ): void {
         this.clearDrawn();
 
         const ridgeGround = CesiumRadarCoverage.groundPointAt(geometry, azimuthDeg, ridgeDist);
         const targetGround = CesiumRadarCoverage.groundPointAt(geometry, azimuthDeg, targetDist);
-        const ridgeTop = Cesium.Cartesian3.fromRadians(ridgeGround.longitude, ridgeGround.latitude, ridgeHeight + GROUND_LIFT_M);
-        const overTarget = Cesium.Cartesian3.fromRadians(
-            targetGround.longitude,
-            targetGround.latitude,
-            CesiumRadarCoverage.beamHeightAt(ridgeAngle, targetDist, geometry.radarHeight)
-        );
-        const targetPoint = Cesium.Cartesian3.fromRadians(targetGround.longitude, targetGround.latitude, targetHeight + GROUND_LIFT_M);
-        const gap = CesiumRadarCoverage.beamHeightAt(ridgeAngle, targetDist, geometry.radarHeight) - targetHeight;
+        const beamOverSpot = CesiumRadarCoverage.beamHeightAt(ridgeAngle, targetDist, geometry.radarHeight);
 
-        // Beam reaches the ridge...
-        this.addLine([geometry.radarPosition, ridgeTop], COLOR_CLEAR, false);
-        // ...grazes it and carries on over the point...
-        this.addLine([ridgeTop, overTarget], COLOR_GRAZING, true);
-        // ...leaving the point this far below it, in the ridge's shadow.
-        this.addLine([overTarget, targetPoint], COLOR_BLOCKED, true);
+        const antenna = this.fixed(geometry.radarPosition);
+        const ridgeTop = this.onGround(ridgeGround, ridgeHeight, GROUND_LIFT_M);
+        // Where the lowest beam over the hill is, straight above the spot.
+        const overSpot = this.fixed(Cesium.Cartesian3.fromRadians(targetGround.longitude, targetGround.latitude, beamOverSpot));
+        const spotGround = this.onGround(targetGround, groundHeight, GROUND_LIFT_M);
+        const aircraft = this.onGround(targetGround, groundHeight, agl);
 
-        this.addTag(overTarget, `Beam passes ${km(gap)} overhead`, COLOR_GRAZING, Cesium.VerticalOrigin.BOTTOM);
+        // Beam reaches the hill top...
+        this.addLine([antenna, ridgeTop], COLOR_CLEAR, false);
+        // ...grazes it and carries on over the spot...
+        this.addLine([ridgeTop, overSpot], COLOR_GRAZING, true);
+        // ...leaving everything below it (down to the aircraft / ground) hidden.
+        this.addLine([overSpot, agl > 0 ? aircraft : spotGround], COLOR_BLOCKED, true);
+        this.drawAircraft(spotGround, aircraft, agl);
+
+        this.addTag(overSpot, `Beam ${km(beamOverSpot - groundHeight)} up`, COLOR_GRAZING, Cesium.VerticalOrigin.BOTTOM);
 
         this.add({
-            position: ridgeTop,
+            position: this.positionOf(ridgeTop),
             point: {
                 pixelSize: 11,
                 color: COLOR_BLOCKED,
                 outlineColor: Cesium.Color.WHITE,
                 outlineWidth: 2,
-                heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
                 disableDepthTestDistance: Number.POSITIVE_INFINITY
             },
             label: {
-                text: "Terrain blocks the beam here",
+                text: "Blocking ground",
                 font: "12px sans-serif",
                 fillColor: Cesium.Color.WHITE,
                 showBackground: true,
                 backgroundColor: COLOR_BLOCKED.withAlpha(0.85),
-                // Below the marker, so it never sits on the "overhead" tag above.
+                // Below the marker, so it never sits on the "lowest beam" tag above.
                 verticalOrigin: Cesium.VerticalOrigin.TOP,
                 pixelOffset: new Cesium.Cartesian2(0, 12),
-                heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
                 disableDepthTestDistance: Number.POSITIVE_INFINITY
             }
         });
     }
 
-    private drawRay(from: Cesium.Cartesian3, target: Cesium.Cartographic, targetHeight: number, color: Cesium.Color): void {
+    // Straight ray from the antenna to the aircraft over the spot (or to the
+    // ground when checking the ground itself).
+    private drawRay(
+        geometry: RadarGeometry,
+        target: Cesium.Cartographic,
+        groundHeight: number,
+        agl: number,
+        color: Cesium.Color
+    ): void {
         this.clearDrawn();
-        this.addLine(
-            [from, Cesium.Cartesian3.fromRadians(target.longitude, target.latitude, targetHeight + GROUND_LIFT_M)],
-            color,
-            false
-        );
+        const spotGround = this.onGround(target, groundHeight, GROUND_LIFT_M);
+        const aircraft = this.onGround(target, groundHeight, agl);
+        this.addLine([this.fixed(geometry.radarPosition), agl > 0 ? aircraft : spotGround], color, false);
+        this.drawAircraft(spotGround, aircraft, agl);
     }
 
     // Small coloured text tag, no marker.
     private addTag(
-        position: Cesium.Cartesian3,
+        position: Point,
         text: string,
         color: Cesium.Color,
         verticalOrigin = Cesium.VerticalOrigin.CENTER
     ): void {
         this.add({
-            position,
+            position: this.positionOf(position),
             label: {
                 text,
                 font: "12px sans-serif",
@@ -342,14 +407,14 @@ export class CesiumLosProbe {
         });
     }
 
-    private addLine(positions: Cesium.Cartesian3[], color: Cesium.Color, dashed: boolean): void {
+    private addLine(points: Point[], color: Cesium.Color, dashed: boolean, width?: number): void {
         const material = dashed
             ? new Cesium.PolylineDashMaterialProperty({ color, dashLength: 16 })
             : new Cesium.PolylineGlowMaterialProperty({ color, glowPower: 0.15 });
         this.add({
             polyline: {
-                positions,
-                width: dashed ? 3 : 6,
+                positions: new Cesium.CallbackProperty(() => points.map(p => p()), false),
+                width: width ?? (dashed ? 3 : 6),
                 arcType: Cesium.ArcType.NONE,
                 material,
                 // Stay readable where a hill is between the camera and the line.

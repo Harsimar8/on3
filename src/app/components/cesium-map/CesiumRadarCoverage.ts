@@ -26,6 +26,8 @@ export interface RadarOptions {
     showCylinders?: boolean;
     interiorLayers?: number;
     showBlockedPoints?: boolean;
+    // Height above the terrain of the aircraft the coverage is worked out for.
+    targetHeightAgl?: number;
     shadowOpacity?: number;
     showShadow?: boolean;
     bandOpacity?: number;
@@ -116,6 +118,7 @@ export interface RadarGeometry {
     radarHeight: number;
     enuMatrix: Cesium.Matrix4;
     zones: ResolvedZone[];
+    targetHeightAgl: number;
 }
 
 
@@ -143,6 +146,9 @@ const NEAR_FIELD_IGNORE_M = 10;
 // (e.g. a 1 m bump right next to a radar standing on the ground) and the beam
 // is taken to reach the point.
 const RIDGE_TOLERANCE_M = 2;
+// Coverage is shown for an aircraft flying this far above the terrain, unless
+// the radar sets its own "targetHeightAgl".
+export const DEFAULT_TARGET_HEIGHT_AGL_M = 20;
 // Largest side of the shading texture, in pixels.
 const COVERAGE_TEXTURE_MAX_PX = 2048;
 // Colour of ground in range that the radar does not cover (hidden behind
@@ -151,9 +157,15 @@ const SHADOW_FILL_RGBA = [0, 0, 0, 255];
 // The panel's "Interior Beam" slider runs 0 - 0.30; that span maps to the
 // range rings' full 0 - 1 opacity.
 const INTERIOR_SLIDER_MAX = 0.3;
-// Air layer over dark ground: at most this many vertices along each ray.
+// Zone beams in the air: at most this many vertices along each ray.
 const AIR_LAYER_MAX_COLUMNS = 300;
-// The air layer never sits lower than this above the highest ground around
+// The underside of the beams is only drawn where terrain lifts the lowest
+// seen height at least this far above the ground.
+const AIR_UNDERSIDE_MIN_M = 30;
+// A beam top is only drawn where it is at least this far above the highest
+// ground around it, so it never cuts through the terrain.
+const BEAM_TOP_CLEARANCE_M = 5;
+// Beam surfaces never sit lower than this above the highest ground around
 // each of its points (including the ground between neighbouring rays), so it
 // drapes over the terrain's shape without hills poking through it.
 const AIR_LAYER_MIN_LIFT_M = 20;
@@ -216,6 +228,7 @@ export class CesiumRadarCoverage {
             azimuthStepDeg = 2,
             rangeSampleSteps,
             showBlockedPoints = false,
+            targetHeightAgl = DEFAULT_TARGET_HEIGHT_AGL_M,
             interiorOpacity = 0.08,
             showInterior = true,
             zoneOverrides = {}
@@ -272,7 +285,7 @@ export class CesiumRadarCoverage {
 
         if (zones.length === 0) return handles;
 
-        const geometry: RadarGeometry = { radarPosition, radarHeight, enuMatrix, zones };
+        const geometry: RadarGeometry = { radarPosition, radarHeight, enuMatrix, zones, targetHeightAgl };
         CesiumRadarCoverage.geometries.set(entityId, geometry);
         handles.push({
             dispose: () => {
@@ -321,7 +334,7 @@ export class CesiumRadarCoverage {
                 spacing: group.spacing,
                 maxRange: group.maxRange,
                 profiles,
-                viewsheds: profiles.map(profile => CesiumRadarCoverage.computeViewshed(profile, radarHeight)),
+                viewsheds: profiles.map(profile => CesiumRadarCoverage.computeViewshed(profile, radarHeight, targetHeightAgl)),
                 floors: profiles.map(profile => CesiumRadarCoverage.computeFloor(profile, radarHeight))
             });
         }
@@ -338,9 +351,9 @@ export class CesiumRadarCoverage {
             cylinderOpacity: options.cylinderOpacity ?? 0.15,
             showCylinders: options.showCylinders ?? true,
             shadowOpacity: options.shadowOpacity ?? 0.6,
-            showShadow: options.showShadow ?? true,
+            showShadow: options.showShadow ?? false,
             bandOpacity: options.bandOpacity ?? 0.3,
-            showBand: options.showBand ?? true
+            showBand: options.showBand ?? false
         };
         let litColor = Cesium.Color.WHITE.withAlpha(style.beamOpacity);
         const shadowColorOf = (st: RadarStyle) => Cesium.Color.WHITE.withAlpha(st.showShadow ? st.shadowOpacity : 0);
@@ -441,12 +454,11 @@ export class CesiumRadarCoverage {
             });
         };
 
-        // Air layer: over ground the radar cannot see (dark), a see-through
-        // surface in the zone's colour at the lowest height the radar does see.
-        // Aircraft above it are detected. Geometry is worked out once; opacity
-        // changes only rebuild the cheap primitive from it.
+        // Zone beams in the air: each zone's beam (0 to its top angle) as
+        // see-through surfaces, cut where terrain masks the air. Geometry is
+        // worked out once; opacity changes only rebuild the cheap primitive.
         const airLayers = Array.from(fans.entries())
-            .map(([key, fan]) => CesiumRadarCoverage.buildAirLayer(
+            .map(([key, fan]) => CesiumRadarCoverage.buildAirVolume(
                 fan,
                 zones.filter(z => `${z.azimuthStartDeg}|${z.azimuthWidthDeg}` === key),
                 radarHeight
@@ -684,10 +696,12 @@ export class CesiumRadarCoverage {
     // -------------------------------------------------------------------
     // 5. Line-of-Sight Along One Azimuth: computeViewshed
     // -------------------------------------------------------------------
-    // Walking outward, a ground point is visible if the angle from the antenna
-    // down/up to it is at least as high as the angle to every point before it.
-    // Anything lower is hidden behind something nearer: radar shadow.
-    private static computeViewshed(profile: TerrainProfile, radarHeight: number): Viewshed {
+    // Walking outward, an aircraft flying `targetHeightAgl` above the ground at
+    // each sample is visible if the angle from the antenna up/down to it is at
+    // least as high as the terrain horizon built from every ground point before
+    // it (terrain masking). Anything lower is hidden behind nearer terrain.
+    // `visible` and `angle` describe that aircraft (0 m = the ground itself).
+    private static computeViewshed(profile: TerrainProfile, radarHeight: number, targetHeightAgl: number): Viewshed {
         const { horizontalDistances, groundHeights } = profile;
         const n = horizontalDistances.length;
         const visible = new Uint8Array(n);
@@ -699,16 +713,19 @@ export class CesiumRadarCoverage {
         let horizon = -Infinity;
 
         for (let i = 1; i < n; i++) {
+            const d = horizontalDistances[i];
             // The ground curves away below a straight beam (4/3 Earth model).
-            const a = CesiumRadarCoverage.elevationAngle(groundHeights[i], horizontalDistances[i], radarHeight);
+            const groundAngle = CesiumRadarCoverage.elevationAngle(groundHeights[i], d, radarHeight);
+            const targetAngle = CesiumRadarCoverage.elevationAngle(groundHeights[i] + targetHeightAgl, d, radarHeight);
 
-            angle[i] = a;
-            if (horizontalDistances[i] < NEAR_FIELD_IGNORE_M) {
+            angle[i] = targetAngle;
+            if (d < NEAR_FIELD_IGNORE_M) {
                 visible[i] = 1;
                 continue;
             }
-            visible[i] = Math.tan(a) >= horizon ? 1 : 0;
-            horizon = Math.max(horizon, CesiumRadarCoverage.horizonTan(a, horizontalDistances[i]));
+            visible[i] = Math.tan(targetAngle) >= horizon ? 1 : 0;
+            // Only the terrain itself masks what lies behind it.
+            horizon = Math.max(horizon, CesiumRadarCoverage.horizonTan(groundAngle, d));
         }
         return { visible, angle };
     }
@@ -742,16 +759,21 @@ export class CesiumRadarCoverage {
     }
 
     // -------------------------------------------------------------------
-    // 5c. Air Layer Over Dark Ground: buildAirLayer
+    // 5c. Zone Beams In The Air: buildAirVolume
     // -------------------------------------------------------------------
-    // A mesh over the fan: one row of vertices per azimuth, one column per
-    // (thinned) range sample. A vertex is "on" where the ground is dark (not
-    // seen by any zone) but some zone's beam covers air above it: it sits at
-    // the lowest seen height (computeFloor) and takes the colour of the first
-    // zone, nearest first, whose top line is above that height. Each vertex's
-    // opacity is the share of "on" vertices around it, so the layer fades out
-    // softly at its edges instead of ending in steps.
-    private static buildAirLayer(
+    // The air each zone covers, drawn over the fan as see-through surfaces in
+    // the zone's colour (one row of vertices per azimuth, one column per
+    // thinned range sample):
+    //   - top of each zone's beam: the cone from the antenna at the zone's top
+    //     angle (0-10°, 0-20°, 0-30° nest inside each other), out to the zone's
+    //     range. Cut away where terrain hides the air right up to that height.
+    //   - underside where terrain masks the air: over ground hidden behind
+    //     terrain, the lowest height the radar sees (computeFloor), hanging in
+    //     the air, coloured by the zone whose beam starts there. Not drawn where
+    //     the radar sees right down to the ground (that ground is already tinted).
+    // Each vertex's opacity is the share of shown vertices around it, so cut
+    // edges fade out softly instead of ending in steps.
+    private static buildAirVolume(
         fan: Fan,
         zones: ResolvedZone[],
         radarHeight: number
@@ -764,7 +786,7 @@ export class CesiumRadarCoverage {
         for (let i = 0; i < n; i += step) columns.push(i);
         if (columns[columns.length - 1] !== n - 1) columns.push(n - 1);
         const cols = columns.length;
-        const vertexCount = rows * cols;
+        const gridSize = rows * cols;
         const wrap = fan.widthDeg >= 360;
 
         const zoneTan = zones.map(z => Math.tan(Cesium.Math.toRadians(z.maxElevationDeg)));
@@ -773,36 +795,11 @@ export class CesiumRadarCoverage {
             Math.round(z.color.green * 255),
             Math.round(z.color.blue * 255)
         ]);
+        const topAt = (k: number, d: number) => CesiumRadarCoverage.beamHeightAt(Math.atan(zoneTan[k]), d, radarHeight);
 
-        const on = new Uint8Array(vertexCount);
-        const heights = new Float64Array(vertexCount);
-        const rgb = new Uint8Array(vertexCount * 3);
-
-        fan.profiles.forEach((profile, r) => {
-            const floor = fan.floors[r];
-            const viewshed = fan.viewsheds[r];
-            columns.forEach((i, c) => {
-                const v = r * cols + c;
-                const d = profile.horizontalDistances[i];
-                const ground = profile.groundHeights[i];
-                heights[v] = floor[i];
-                if (d <= 0) return;
-
-                const lit = viewshed.visible[i] === 1 && zones.some(z =>
-                    d <= z.range && viewshed.angle[i] <= Cesium.Math.toRadians(z.maxElevationDeg));
-                if (lit) return;
-
-                const z = zones.findIndex((zone, k) =>
-                    d <= zone.range && floor[i] < CesiumRadarCoverage.beamHeightAt(Math.atan(zoneTan[k]), d, radarHeight));
-                if (z < 0) return;
-                on[v] = 1;
-                rgb.set(zoneRgb[z], v * 3);
-            });
-        });
-
-        // Lift every vertex clear of the highest ground in the cells around it:
-        // the neighbouring rays, and every full-resolution sample between this
-        // column and the next ones.
+        // Highest ground around each vertex (neighbouring rays and the samples
+        // between columns), so surfaces near the ground clear the terrain.
+        const highestAround = new Float64Array(gridSize);
         fan.profiles.forEach((profile, r) => {
             columns.forEach((i, c) => {
                 let highest = -Infinity;
@@ -811,66 +808,116 @@ export class CesiumRadarCoverage {
                     if (wrap) rr = (rr + rows) % rows;
                     if (rr < 0 || rr >= rows) continue;
                     const ground = fan.profiles[rr].groundHeights;
-                    const from = Math.max(0, i - step);
-                    const to = Math.min(n - 1, i + step);
-                    for (let k = from; k <= to; k++) highest = Math.max(highest, ground[k]);
-                }
-                const v = r * cols + c;
-                heights[v] = Math.max(heights[v], highest + AIR_LAYER_MIN_LIFT_M);
-            });
-        });
-
-        // Soft edges: opacity = share of "on" vertices in the 3 x 3 block around.
-        // Off vertices next to the layer borrow a neighbour's colour to fade in.
-        const fade = new Float32Array(vertexCount);
-        for (let r = 0; r < rows; r++) {
-            for (let c = 0; c < cols; c++) {
-                let count = 0;
-                let total = 0;
-                let donor = -1;
-                for (let dr = -1; dr <= 1; dr++) {
-                    let rr = r + dr;
-                    if (wrap) rr = (rr + rows) % rows;
-                    if (rr < 0 || rr >= rows) continue;
-                    for (let dc = -1; dc <= 1; dc++) {
-                        const cc = c + dc;
-                        if (cc < 0 || cc >= cols) continue;
-                        total++;
-                        if (on[rr * cols + cc]) {
-                            count++;
-                            donor = rr * cols + cc;
-                        }
+                    for (let k = Math.max(0, i - step); k <= Math.min(n - 1, i + step); k++) {
+                        highest = Math.max(highest, ground[k]);
                     }
                 }
-                const v = r * cols + c;
-                fade[v] = total ? count / total : 0;
-                if (!on[v] && donor >= 0) rgb.copyWithin(v * 3, donor * 3, donor * 3 + 3);
-            }
-        }
-
-        const positions = new Float64Array(vertexCount * 3);
-        const scratch = new Cesium.Cartesian3();
-        fan.profiles.forEach((profile, r) => {
-            columns.forEach((i, c) => {
-                const v = r * cols + c;
-                const p = profile.groundPoints[i];
-                Cesium.Cartesian3.fromRadians(p.longitude, p.latitude, heights[v], undefined, scratch);
-                positions[v * 3] = scratch.x;
-                positions[v * 3 + 1] = scratch.y;
-                positions[v * 3 + 2] = scratch.z;
+                highestAround[r * cols + c] = highest;
             });
         });
 
-        // Two triangles per cell that has any "on" corner.
+        type Surface = { heights: Float64Array; on: Uint8Array; rgb: Uint8Array };
+        const newSurface = (): Surface => ({
+            heights: new Float64Array(gridSize),
+            on: new Uint8Array(gridSize),
+            rgb: new Uint8Array(gridSize * 3)
+        });
+        const surfaces: Surface[] = [];
+
+        // Top of every zone's beam.
+        zones.forEach((zone, k) => {
+            const surface = newSurface();
+            fan.profiles.forEach((profile, r) => {
+                const floor = fan.floors[r];
+                columns.forEach((i, c) => {
+                    const v = r * cols + c;
+                    const d = profile.horizontalDistances[i];
+                    const top = topAt(k, d);
+                    // Always at the beam's true height; shown only where it is
+                    // really above the terrain (never lifted to a fake height).
+                    surface.heights[v] = top;
+                    surface.rgb.set(zoneRgb[k], v * 3);
+                    if (d > 0 && d <= zone.range && floor[i] < top && top > highestAround[v] + BEAM_TOP_CLEARANCE_M) {
+                        surface.on[v] = 1;
+                    }
+                });
+            });
+            surfaces.push(surface);
+        });
+
+        // Underside where terrain lifts the lowest seen height into the air.
+        const underside = newSurface();
+        fan.profiles.forEach((profile, r) => {
+            const floor = fan.floors[r];
+            columns.forEach((i, c) => {
+                const v = r * cols + c;
+                const d = profile.horizontalDistances[i];
+                underside.heights[v] = Math.max(floor[i], highestAround[v] + AIR_LAYER_MIN_LIFT_M);
+                if (d <= 0 || floor[i] - profile.groundHeights[i] < AIR_UNDERSIDE_MIN_M) return;
+                // The zone whose beam starts at this height: the lowest top above it.
+                let best = -1;
+                zones.forEach((zone, k) => {
+                    if (d > zone.range || floor[i] >= topAt(k, d)) return;
+                    if (best < 0 || topAt(k, d) < topAt(best, d)) best = k;
+                });
+                if (best < 0) return;
+                underside.on[v] = 1;
+                underside.rgb.set(zoneRgb[best], v * 3);
+            });
+        });
+        surfaces.push(underside);
+
+        // Assemble every surface into one mesh.
+        const vertexCount = gridSize * surfaces.length;
+        const positions = new Float64Array(vertexCount * 3);
+        const rgb = new Uint8Array(vertexCount * 3);
+        const fade = new Float32Array(vertexCount);
         const indexList: number[] = [];
-        for (let r = 0; r < (wrap ? rows : rows - 1); r++) {
-            const r2 = (r + 1) % rows;
-            for (let c = 0; c < cols - 1; c++) {
-                const a = r * cols + c, b = a + 1, e = r2 * cols + c, f = e + 1;
-                if (!(on[a] || on[b] || on[e] || on[f])) continue;
-                indexList.push(a, b, e, b, f, e);
+        const scratch = new Cesium.Cartesian3();
+
+        surfaces.forEach((surface, sIdx) => {
+            const offset = sIdx * gridSize;
+            fan.profiles.forEach((profile, r) => {
+                columns.forEach((i, c) => {
+                    const v = r * cols + c;
+                    const p = profile.groundPoints[i];
+                    Cesium.Cartesian3.fromRadians(p.longitude, p.latitude, surface.heights[v], undefined, scratch);
+                    positions.set([scratch.x, scratch.y, scratch.z], (offset + v) * 3);
+                });
+            });
+
+            // Soft edges: opacity = share of shown vertices in the 3 x 3 block.
+            for (let r = 0; r < rows; r++) {
+                for (let c = 0; c < cols; c++) {
+                    let count = 0;
+                    let total = 0;
+                    for (let dr = -1; dr <= 1; dr++) {
+                        let rr = r + dr;
+                        if (wrap) rr = (rr + rows) % rows;
+                        if (rr < 0 || rr >= rows) continue;
+                        for (let dc = -1; dc <= 1; dc++) {
+                            const cc = c + dc;
+                            if (cc < 0 || cc >= cols) continue;
+                            total++;
+                            if (surface.on[rr * cols + cc]) count++;
+                        }
+                    }
+                    const v = r * cols + c;
+                    fade[offset + v] = total ? count / total : 0;
+                    rgb.set(surface.rgb.subarray(v * 3, v * 3 + 3), (offset + v) * 3);
+                }
             }
-        }
+
+            for (let r = 0; r < (wrap ? rows : rows - 1); r++) {
+                const r2 = (r + 1) % rows;
+                for (let c = 0; c < cols - 1; c++) {
+                    const a = r * cols + c, b = a + 1, e = r2 * cols + c, f = e + 1;
+                    if (!(surface.on[a] || surface.on[b] || surface.on[e] || surface.on[f])) continue;
+                    indexList.push(offset + a, offset + b, offset + e, offset + b, offset + f, offset + e);
+                }
+            }
+        });
+
         if (indexList.length === 0) return null;
         const indices = new Uint32Array(indexList);
         const boundingSphere = Cesium.BoundingSphere.fromVertices(positions as unknown as number[]);

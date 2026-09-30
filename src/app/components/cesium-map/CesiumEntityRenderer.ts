@@ -5,7 +5,13 @@ import { EditorState } from "../../core/state/EditorState";
 import { TeamFilterService } from "../../core/services/TeamFilterService";
 import { Team } from "../../core/types/Team";
 import { TeamFilter } from "../../core/models/TeamFilter";
-import { CesiumRadarCoverage, RadarCoverageHandle, RadarStyle, RadarZoneOverride } from "./CesiumRadarCoverage";
+import {
+    CesiumRadarCoverage,
+    DEFAULT_TARGET_HEIGHT_AGL_M,
+    RadarCoverageHandle,
+    RadarStyle,
+    RadarZoneOverride
+} from "./CesiumRadarCoverage";
 
 
 export class CesiumEntityRenderer {
@@ -103,9 +109,9 @@ export class CesiumEntityRenderer {
             cylinderOpacity: props.cylinderOpacity ?? 0.15,
             showCylinders: props.showCylinders ?? true,
             shadowOpacity: props.shadowOpacity ?? 0.6,
-            showShadow: props.showShadow ?? true,
+            showShadow: props.showShadow ?? false,
             bandOpacity: props.bandOpacity ?? 0.3,
-            showBand: props.showBand ?? true
+            showBand: props.showBand ?? false
         };
     }
 
@@ -137,6 +143,7 @@ export class CesiumEntityRenderer {
             // beamOpacity / interiorOpacity / showInterior / cylinder style are deliberately not
             // here: they are applied in place by applyStyle.
             showBlockedPoints: props.showBlockedPoints ?? false,
+            targetHeightAgl: props.targetHeightAgl ?? DEFAULT_TARGET_HEIGHT_AGL_M,
 
             zoneVisibility: props.zoneVisibility ?? {},
             zoneRanges: props.zoneRanges ?? {},
@@ -215,9 +222,10 @@ export class CesiumEntityRenderer {
                     cylinderOpacity: props.cylinderOpacity ?? 0.15,
                     showCylinders: props.showCylinders ?? true,
                     shadowOpacity: props.shadowOpacity ?? 0.6,
-                    showShadow: props.showShadow ?? true,
+                    showShadow: props.showShadow ?? false,
                     bandOpacity: props.bandOpacity ?? 0.3,
-                    showBand: props.showBand ?? true,
+                    showBand: props.showBand ?? false,
+                    targetHeightAgl: props.targetHeightAgl ?? DEFAULT_TARGET_HEIGHT_AGL_M,
                     showBlockedPoints: props.showBlockedPoints ?? false,
 
                     zoneOverrides

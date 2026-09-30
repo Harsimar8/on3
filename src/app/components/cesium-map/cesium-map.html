@@ -195,16 +195,28 @@
       <section class="radar-section">
         <h4 class="radar-section__title">Terrain Blocking</h4>
 
+        <label class="field">
+          <span>Aircraft Height Above Ground (m)</span>
+          <input type="number" min="0" step="10"
+            [value]="getRadarProp('targetHeightAgl', 20)"
+            (change)="onTargetHeightChange($any($event.target).value)">
+        </label>
+
+        <div class="zone-card__hint">
+          Tint = an aircraft flying this high above the terrain is detected there.
+          Clear = hidden by terrain or outside the beam. 0 = the ground itself.
+        </div>
+
         <div class="shadow-legend">
-          <span class="shadow-legend__item"><span class="swatch swatch--lit"></span>Covered (zone colour)</span>
-          <span class="shadow-legend__item"><span class="swatch swatch--shadow"></span>Ground hidden by terrain</span>
+          <span class="shadow-legend__item"><span class="swatch swatch--lit"></span>Aircraft detected (zone colour)</span>
+          <span class="shadow-legend__item"><span class="swatch swatch--shadow"></span>Not detected (optional dark)</span>
         </div>
 
         <label class="checkbox-field">
           <input type="checkbox"
-            [checked]="getRadarProp('showShadow', true)"
+            [checked]="getRadarProp('showShadow', false)"
             (change)="onShadowToggle($any($event.target).checked)">
-          <span>Show Terrain Shadow</span>
+          <span>Darken Not-Detected Area</span>
         </label>
 
         <div class="beam-control">
@@ -228,15 +240,15 @@
 
         <label class="checkbox-field">
           <input type="checkbox"
-            [checked]="getRadarProp('showBand', true)"
+            [checked]="getRadarProp('showBand', false)"
             (change)="onBandToggle($any($event.target).checked)">
-          <span>Air Coverage Layer (3D)</span>
+          <span>Zone Beams in the Air (3D)</span>
         </label>
 
         <div class="zone-card__hint">
-          Above dark ground, a see-through layer in the zone colour floats at the
-          lowest height the radar sees. Aircraft above it are detected. No layer:
-          not seen at any height.
+          Each zone's beam in the air, see-through in its colour: green 0-10°,
+          yellow up to 20°, red up to 30°. Cut away where terrain hides the air;
+          the underside hangs where a hill lifts the lowest height the radar sees.
         </div>
 
         <div class="beam-control">
@@ -283,7 +295,7 @@
               <strong>{{ result.title }}</strong>
               <button class="icon-btn" title="Clear" (click)="clearLosProbe()">✕</button>
             </div>
-            @for (line of result.details; track $index) {
+            @for (line of result.explanation; track $index) {
               <div class="los-result__line">{{ line }}</div>
             }
           </div>
