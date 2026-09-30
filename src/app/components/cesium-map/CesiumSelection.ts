@@ -30,6 +30,13 @@ export class CesiumSelection {
 
         // If a 3D radar wall, cap, or ray was clicked, select its parent radar entity
         // Radar beam primitives carry the radar's id directly as a string
+        // Coverage drawings (shading, rings, markers on ridges) carry their
+        // radar's id but are not the radar: clicking them changes nothing.
+        // Only the radar symbol itself selects the radar.
+        if (typeof pickedEntity !== "string" && pickedEntity.radarParentId && !pickedEntity.isRadarMarker) {
+            return;
+        }
+
         const targetId = typeof pickedEntity === "string"
             ? pickedEntity
             : pickedEntity.radarParentId || pickedEntity.id;

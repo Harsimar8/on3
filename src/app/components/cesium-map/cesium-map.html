@@ -193,6 +193,104 @@
       </section>
 
       <section class="radar-section">
+        <h4 class="radar-section__title">Terrain Blocking</h4>
+
+        <div class="shadow-legend">
+          <span class="shadow-legend__item"><span class="swatch swatch--lit"></span>Covered (zone colour)</span>
+          <span class="shadow-legend__item"><span class="swatch swatch--shadow"></span>Ground hidden by terrain</span>
+        </div>
+
+        <label class="checkbox-field">
+          <input type="checkbox"
+            [checked]="getRadarProp('showShadow', true)"
+            (change)="onShadowToggle($any($event.target).checked)">
+          <span>Show Terrain Shadow</span>
+        </label>
+
+        <div class="beam-control">
+          <div class="beam-control__header">
+            <span>Shadow Opacity</span>
+            <strong>{{ getRadarProp('shadowOpacity', 0.6) * 100 | number:'1.0-0' }}%</strong>
+          </div>
+          <input
+            class="beam-slider"
+            type="range"
+            min="0"
+            max="1"
+            step="0.01"
+            [value]="getRadarProp('shadowOpacity', 0.6)"
+            (input)="onShadowOpacityChange($any($event.target).value)">
+          <div class="beam-control__range">
+            <span>Transparent</span>
+            <span>Solid</span>
+          </div>
+        </div>
+
+        <label class="checkbox-field">
+          <input type="checkbox"
+            [checked]="getRadarProp('showBand', true)"
+            (change)="onBandToggle($any($event.target).checked)">
+          <span>Air Coverage Layer (3D)</span>
+        </label>
+
+        <div class="zone-card__hint">
+          Above dark ground, a see-through layer in the zone colour floats at the
+          lowest height the radar sees. Aircraft above it are detected. No layer:
+          not seen at any height.
+        </div>
+
+        <div class="beam-control">
+          <div class="beam-control__header">
+            <span>Air Coverage Opacity</span>
+            <strong>{{ getRadarProp('bandOpacity', 0.3) * 100 | number:'1.0-0' }}%</strong>
+          </div>
+          <input
+            class="beam-slider"
+            type="range"
+            min="0"
+            max="1"
+            step="0.01"
+            [value]="getRadarProp('bandOpacity', 0.3)"
+            (change)="onBandOpacityChange($any($event.target).value)">
+          <div class="beam-control__range">
+            <span>Transparent</span>
+            <span>Solid</span>
+          </div>
+        </div>
+
+        <label class="checkbox-field">
+          <input type="checkbox"
+            [checked]="losProbeEnabled()"
+            (change)="onLosProbeToggle($any($event.target).checked)">
+          <span>Explain Blocking on Click</span>
+        </label>
+
+        @if (losProbeEnabled()) {
+          <label class="checkbox-field">
+            <input type="checkbox"
+              [checked]="losProbeHover()"
+              (change)="onLosProbeHoverToggle($any($event.target).checked)">
+            <span>Follow Mouse</span>
+          </label>
+          <div class="zone-card__hint">
+            {{ losProbeHover() ? 'Move the mouse' : 'Click any spot' }} inside the coverage to see the radar's line of sight to it.
+          </div>
+        }
+
+        @if (losProbeResult(); as result) {
+          <div class="los-result" [attr.data-status]="result.status">
+            <div class="los-result__header">
+              <strong>{{ result.title }}</strong>
+              <button class="icon-btn" title="Clear" (click)="clearLosProbe()">✕</button>
+            </div>
+            @for (line of result.details; track $index) {
+              <div class="los-result__line">{{ line }}</div>
+            }
+          </div>
+        }
+      </section>
+
+      <section class="radar-section">
         <h4 class="radar-section__title">Coverage Zones (Width &amp; Range)</h4>
 
         @for (zone of radarZones; track zone.name) {

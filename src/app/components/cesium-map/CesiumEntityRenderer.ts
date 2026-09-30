@@ -101,7 +101,11 @@ export class CesiumEntityRenderer {
             interiorOpacity: props.interiorOpacity ?? 0.08,
             showInterior: props.showInterior ?? true,
             cylinderOpacity: props.cylinderOpacity ?? 0.15,
-            showCylinders: props.showCylinders ?? true
+            showCylinders: props.showCylinders ?? true,
+            shadowOpacity: props.shadowOpacity ?? 0.6,
+            showShadow: props.showShadow ?? true,
+            bandOpacity: props.bandOpacity ?? 0.3,
+            showBand: props.showBand ?? true
         };
     }
 
@@ -210,6 +214,10 @@ export class CesiumEntityRenderer {
                     showInterior: props.showInterior ?? true,
                     cylinderOpacity: props.cylinderOpacity ?? 0.15,
                     showCylinders: props.showCylinders ?? true,
+                    shadowOpacity: props.shadowOpacity ?? 0.6,
+                    showShadow: props.showShadow ?? true,
+                    bandOpacity: props.bandOpacity ?? 0.3,
+                    showBand: props.showBand ?? true,
                     showBlockedPoints: props.showBlockedPoints ?? false,
 
                     zoneOverrides

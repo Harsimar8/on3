@@ -24,6 +24,7 @@ import { CesiumSelection } from "./CesiumSelection";
 import { CesiumGlbManager, PlacedGlb } from "./CesiumGlbManager";
 import { BuildingLayer } from './layers/BuildingLayer';
 import { CesiumObjectDetector } from './CesiumObjectDetector';
+import { CesiumLosProbe, LosProbeResult } from './CesiumLosProbe';
 
 
 
@@ -148,6 +149,16 @@ export class CesiumMap implements AfterViewInit, OnDestroy {
   private lastSelectedEntityId: string | null = null;
   protected readonly radarPanelClosed = signal(false);
 
+  // Click-to-explain line of sight ("why is this spot not covered?").
+  private losProbe!: CesiumLosProbe;
+  protected readonly losProbeEnabled = signal(false);
+  protected readonly losProbeResult = signal<LosProbeResult | null>(null);
+  // Re-run the probe under the mouse as it moves. Only one probe runs at a
+  // time; the newest mouse position waits and runs when it finishes.
+  protected readonly losProbeHover = signal(false);
+  private hoverProbeBusy = false;
+  private hoverProbePending: Cesium.Cartesian2 | null = null;
+
   private glbManager!: CesiumGlbManager;
   protected readonly placedGlbs = signal<PlacedGlb[]>([]);
   protected readonly glbBusy = signal(false);
@@ -256,6 +267,8 @@ export class CesiumMap implements AfterViewInit, OnDestroy {
 
     );
 
+    this.losProbe = new CesiumLosProbe(this.viewer, terrainProvider);
+
     this.glbManager = new CesiumGlbManager(
       this.viewer,
       terrainProvider,
@@ -279,6 +292,11 @@ export class CesiumMap implements AfterViewInit, OnDestroy {
     handler.setInputAction(
       this.handleLeftClick.bind(this),
       Cesium.ScreenSpaceEventType.LEFT_CLICK
+    );
+
+    handler.setInputAction(
+      (move: Cesium.ScreenSpaceEventHandler.MotionEvent) => this.hoverLosProbe(move.endPosition),
+      Cesium.ScreenSpaceEventType.MOUSE_MOVE
     );
     //     handler.setInputAction(
 
@@ -540,6 +558,36 @@ onInteriorToggle(checked: boolean): void {
   });
 }
 
+  onShadowOpacityChange(value: string): void {
+    this.updateRadarProperty({ shadowOpacity: Math.max(0, Math.min(1, +value)) });
+  }
+
+  onShadowToggle(checked: boolean): void {
+    this.updateRadarProperty({ showShadow: checked });
+  }
+
+  onBandOpacityChange(value: string): void {
+    this.updateRadarProperty({ bandOpacity: Math.max(0, Math.min(1, +value)) });
+  }
+
+  onBandToggle(checked: boolean): void {
+    this.updateRadarProperty({ showBand: checked });
+  }
+
+  onLosProbeToggle(checked: boolean): void {
+    this.losProbeEnabled.set(checked);
+    if (!checked) this.clearLosProbe();
+  }
+
+  onLosProbeHoverToggle(checked: boolean): void {
+    this.losProbeHover.set(checked);
+  }
+
+  clearLosProbe(): void {
+    this.losProbe?.clear();
+    this.losProbeResult.set(null);
+  }
+
   onShowBlockedPointsChange(checked: boolean): void {
     this.updateRadarProperty({ showBlockedPoints: checked });
   }
@@ -558,6 +606,7 @@ onInteriorToggle(checked: boolean): void {
 
   closeRadarPanel(): void {
     this.radarPanelClosed.set(true);
+    this.clearLosProbe();
   }
 
   /** Rebuilds every radar's coverage, e.g. after an obstacle moved or resized. */
@@ -665,11 +714,95 @@ onInteriorToggle(checked: boolean): void {
 
       this.placement.placeEntity(click);
 
-    } else {
+    } else if (!this.tryLosProbe(click, cartesian)) {
 
       this.selection.selectEntity(click);
 
+      // Clicking the radar symbol opens its panel, even if it was closed with X.
+      if ((this.viewer.scene.pick(click.position) as any)?.id?.isRadarMarker) {
+        this.radarPanelClosed.set(false);
+      }
+
     }
+  }
+
+  /** The probe works on the selected radar while its panel is open. */
+  private losProbeActive(): boolean {
+    return this.losProbeEnabled() &&
+      !this.radarPanelClosed() &&
+      this.editorState.selectedEntity()?.definition.entityType === 'RadarSite';
+  }
+
+  /**
+   * With the probe on, a click on ground (or on radar shading) within a radar's
+   * range explains that radar's line of sight to it instead of changing the
+   * selection. Clicking an actual entity still selects it.
+   */
+  private tryLosProbe(
+    click: Cesium.ScreenSpaceEventHandler.PositionedEvent,
+    cartesian: Cesium.Cartesian3 | undefined
+  ): boolean {
+
+    if (!this.losProbeActive() || !Cesium.defined(cartesian)) {
+      return false;
+    }
+
+    // A click on a radar or another entity selects it as usual.
+    const picked = this.viewer.scene.pick(click.position);
+    const pickedEntity = (picked as any)?.id;
+    if (pickedEntity instanceof Cesium.Entity && (
+      (pickedEntity as any).isRadarMarker ||
+      (!(pickedEntity as any).radarParentId && this.entityRepository.all().some(e => e.id === pickedEntity.id))
+    )) {
+      return false;
+    }
+
+    const ground = this.groundAt(click.position) ?? cartesian;
+    return this.runLosProbe(Cesium.Cartographic.fromCartesian(ground)) !== null;
+  }
+
+  private hoverLosProbe(position: Cesium.Cartesian2): void {
+    if (!this.losProbeActive() || !this.losProbeHover() || this.editorState.placementMode()) {
+      return;
+    }
+    if (this.hoverProbeBusy) {
+      this.hoverProbePending = Cesium.Cartesian2.clone(position);
+      return;
+    }
+
+    const ground = this.groundAt(position);
+    const run = ground ? this.runLosProbe(Cesium.Cartographic.fromCartesian(ground)) : null;
+    if (!run) return;
+
+    this.hoverProbeBusy = true;
+    run.finally(() => {
+      this.hoverProbeBusy = false;
+      const next = this.hoverProbePending;
+      this.hoverProbePending = null;
+      if (next) this.hoverLosProbe(next);
+    });
+  }
+
+  /** Probes the radar that covers this ground point; null (and clears) if none does. */
+  private runLosProbe(target: Cesium.Cartographic): Promise<void> | null {
+    const selected = this.editorState.selectedEntity();
+    const preferred = selected?.definition.entityType === 'RadarSite' ? selected.id : null;
+    const radarId = this.losProbe.findRadarFor(target, preferred);
+
+    if (!radarId) {
+      this.clearLosProbe();
+      return null;
+    }
+
+    return this.losProbe.probe(radarId, target).then(result => {
+      if (result) this.losProbeResult.set(result);
+    });
+  }
+
+  /** Terrain under a screen position, ignoring labels and lines drawn on top. */
+  private groundAt(position: Cesium.Cartesian2): Cesium.Cartesian3 | undefined {
+    const ray = this.viewer.camera.getPickRay(position);
+    return ray ? this.viewer.scene.globe.pick(ray, this.viewer.scene) : undefined;
   }
 
   public resize(): void {
